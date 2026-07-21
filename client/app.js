@@ -1,0 +1,2931 @@
+/* ============ CONFIG ============ */
+// If you host the frontend separately from the backend (e.g. client on Netlify,
+// server on Render/Railway), set this to your backend's full URL, e.g.
+// const SERVER_URL = "https://together-server.onrender.com";
+const SERVER_URL = window.TOGETHER_SERVER_URL || "";
+
+// When the Android app loads this page inside its WebView, it appends
+// ?native=1 to the URL. In that mode, the native app owns the camera/mic/
+// screen-share call entirely (using the real WebRTC Android SDK, so screen
+// share can keep running in the background) — this page just handles chat,
+// YouTube, Spotify, reactions, and moments, and gets out of the call's way.
+const NATIVE_MODE = new URLSearchParams(window.location.search).get("native") === "1";
+
+// One anonymous counter bump per page load — no IP logging, no cookies set
+// for this, nothing per-visitor. Just "how many times has this page been
+// opened," visible later via the /api/admin/stats endpoint.
+fetch(`${SERVER_URL}/api/track-visit`, { method: "POST" }).catch(() => {});
+
+/* ============ STATE ============ */
+let socket = null;
+let roomId = null;
+let myName = "You";
+let myPin = null;
+let isHost = false; // authoritative, set from the server (first to join a room) — controls the kick button
+let localStream = null;
+let pc = null;
+let remoteSocketId = null;
+let sourceType = "youtube"; // which TAB is currently visible — purely a UI concern now
+let loadedMediaType = null; // 'youtube' | 'upload' | 'spotify' | null — whatever's actually loaded & being kept in sync, independent of which tab you're looking at
+let screenShareActive = false; // true while either side has a live screen-share stream
+let ytPlayer = null;
+let ytReady = false;
+let suppressSync = false;
+let togetherSeconds = 0;
+let togetherInterval = null;
+let currentDuration = 0;
+let amHost = false; // first person into an empty room — used to assign game roles (X/red/draws-first)
+let socketConnectCount = 0; // how many times THIS enterRoom's socket has fired "connect" — 2+ means it's a reconnect, not the first handshake
+let hasReceivedRoomStateBefore = false; // guards against replaying the whole chat history a second time on reconnect
+const TAB_ID = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`; // identifies THIS browser tab, for the same-room-multiple-tabs check
+let tabHeartbeatInterval = null;
+let multiTabWarningPending = false; // set in enterRoom, consumed once the socket actually connects (see below) so it isn't clobbered by the "Connecting…" banner
+
+/* ---- Director's chair ---- */
+let directorId = null; // socket id of whoever currently holds exclusive play/pause/seek control, or null if open to both
+let directorName = null;
+let lastKnownVideoState = null; // freshest official video state, used to revert a blocked local action
+let loadedSourceId = null; // videoId / "type:id" / upload URL of whatever's actually loaded — used by "queue what's loaded"
+
+// STUN alone fails on strict networks (corporate/college wifi, some carrier
+// NATs, or just two people on different home networks) — TURN is a relay
+// fallback for exactly those cases, and it's usually *why* two people can
+// each be on a call with camera/mic working locally but never connect to
+// each other. The public credentials below (Open Relay Project) are free,
+// shared, and rate-limited — fine for two people, but for heavier/production
+// use get your own free ones in ~2 minutes at
+// https://www.metered.ca/tools/openrelay/ (or dashboard.metered.ca) and set
+// window.TOGETHER_TURN_USERNAME / window.TOGETHER_TURN_CREDENTIAL before
+// this script runs to override the shared ones.
+const TURN_USERNAME = window.TOGETHER_TURN_USERNAME || "openrelayproject";
+const TURN_CREDENTIAL = window.TOGETHER_TURN_CREDENTIAL || "openrelayproject";
+
+const ICE_SERVERS = [
+  { urls: "stun:stun.l.google.com:19302" },
+  { urls: "stun:openrelay.metered.ca:80" },
+  { urls: "turn:openrelay.metered.ca:80", username: TURN_USERNAME, credential: TURN_CREDENTIAL },
+  { urls: "turn:openrelay.metered.ca:443", username: TURN_USERNAME, credential: TURN_CREDENTIAL },
+  { urls: "turn:openrelay.metered.ca:443?transport=tcp", username: TURN_USERNAME, credential: TURN_CREDENTIAL },
+];
+
+/* ============ DOM ============ */
+const $ = (id) => document.getElementById(id);
+
+/* ============ RING LIGHT ============ */
+function applyRingColor(value) {
+  const isRainbow = value === "rainbow";
+  document.querySelectorAll(".glow-ring").forEach((el) => el.classList.toggle("rainbow", isRainbow));
+  if (!isRainbow) {
+    document.documentElement.style.setProperty("--ring-color", value);
+  }
+  document.querySelectorAll(".ring-swatch").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.ring === value);
+  });
+  localStorage.setItem("together_ring_color", value);
+}
+
+document.querySelectorAll(".ring-swatch").forEach((btn) => {
+  btn.addEventListener("click", () => applyRingColor(btn.dataset.ring));
+});
+$("ringCustomColor").addEventListener("input", (e) => applyRingColor(e.target.value));
+
+applyRingColor(localStorage.getItem("together_ring_color") || "#F2A65A");
+
+/* ============ VOICE-REACTIVE RING GLOW ============ */
+// Makes each person's ring pulse with their OWN mic volume — a quick visual
+// "who's talking" cue that doesn't require watching the video closely.
+// Runs entirely client-side per stream (local mic, or the remote audio track
+// once it arrives over WebRTC) — nothing here touches the server.
+let voiceGlowAudioCtx = null;
+function startVoiceReactiveGlow(stream, glowElId) {
+  if (!stream.getAudioTracks().length) return; // nothing to analyse (video-only / muted-forever case)
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  if (!AudioCtx) return; // unsupported browser — ring just won't pulse, no error
+  try {
+    voiceGlowAudioCtx = voiceGlowAudioCtx || new AudioCtx();
+    const source = voiceGlowAudioCtx.createMediaStreamSource(stream);
+    const analyser = voiceGlowAudioCtx.createAnalyser();
+    analyser.fftSize = 512;
+    analyser.smoothingTimeConstant = 0.6;
+    source.connect(analyser);
+    const data = new Uint8Array(analyser.frequencyBinCount);
+    const el = $(glowElId);
+    const tick = () => {
+      if (!document.body.contains(el)) return; // page navigated away — stop the loop
+      analyser.getByteFrequencyData(data);
+      const avg = data.reduce((sum, v) => sum + v, 0) / data.length; // 0-255
+      const level = Math.min(1, avg / 70); // normalize — mic levels rarely peg 255 in normal speech
+      if (level > 0.06) {
+        el.style.boxShadow = `0 0 ${14 + level * 26}px ${2 + level * 8}px var(--ring-color, #F2A65A)`;
+      } else {
+        el.style.boxShadow = ""; // fall back to the CSS default (idle/connected states)
+      }
+      requestAnimationFrame(tick);
+    };
+    tick();
+  } catch (e) {
+    // Audio analysis is a nice-to-have — if it fails (autoplay policy quirks,
+    // an already-closed AudioContext, etc), the call itself is unaffected.
+  }
+}
+
+/* ============ LANDING ============ */
+
+// Cursor-tracking spotlight + gentle tilt on the ticket cards — the spotlight
+// position feeds the --mx/--my CSS vars from style.css, the tilt is a small
+// rotation based on how far the cursor is from center.
+document.querySelectorAll(".ticket, .chat-panel").forEach((card) => {
+  card.addEventListener("pointermove", (e) => {
+    const rect = card.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    card.style.setProperty("--mx", `${x}px`);
+    card.style.setProperty("--my", `${y}px`);
+
+    const cx = rect.width / 2;
+    const cy = rect.height / 2;
+    const tiltX = ((y - cy) / cy) * -6; // degrees
+    const tiltY = ((x - cx) / cx) * 6;
+    card.style.transform = `perspective(600px) rotateX(${tiltX}deg) rotateY(${tiltY}deg) translateY(-2px)`;
+  });
+  card.addEventListener("pointerleave", () => {
+    card.style.transform = "";
+  });
+});
+// Accepts either a bare code ("glow-482") or a full invite link
+// ("https://yourapp.com/?room=glow-482") pasted into the same field,
+// and always normalizes to the same lowercase/trimmed format so two
+// people never accidentally land in different rooms over a typo.
+function normalizeRoomCode(raw) {
+  if (!raw) return "";
+  let value = raw.trim();
+  try {
+    if (value.includes("://")) {
+      const url = new URL(value);
+      value = url.searchParams.get("room") || value;
+    }
+  } catch (e) {
+    // not a valid URL, treat as a plain code
+  }
+  return value.trim().toLowerCase().replace(/\s+/g, "-");
+}
+
+// Real room codes only ever look like "glow-482" or a custom short slug —
+// this catches obviously-broken input (a mangled link, stray punctuation,
+// someone pasting a whole sentence) before it silently becomes a brand-new,
+// permanently-empty room with no indication anything went wrong.
+function isPlausibleRoomCode(code) {
+  return /^[a-z0-9](?:[a-z0-9-]{0,58}[a-z0-9])?$/.test(code);
+}
+
+$("createRoomBtn").addEventListener("click", async () => {
+  const name = $("nameInputCreate").value.trim() || "Someone";
+  const pin = $("createRoomPin").value.trim() || null;
+  $("createRoomBtn").disabled = true;
+  $("createRoomBtn").textContent = "Creating…";
+  try {
+    const res = await fetch(`${SERVER_URL}/api/create-room`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pin }),
+    });
+    if (!res.ok) throw new Error("bad response");
+    const data = await res.json();
+    if (currentAccount) saveRoomOwnership(data.roomId, name); // fire-and-forget; accounts are optional, never block on this
+    enterRoom(data.roomId, name, pin);
+  } catch (err) {
+    $("landingHint").textContent = "Couldn't reach the server to create a room. Check your connection and try again.";
+    $("createRoomBtn").disabled = false;
+    $("createRoomBtn").textContent = "Create a room";
+  }
+});
+
+$("joinRoomBtn").addEventListener("click", () => {
+  const name = $("nameInputJoin").value.trim() || "Someone";
+  const code = normalizeRoomCode($("roomCodeInput").value);
+  const pin = $("joinRoomPin").value.trim() || null;
+  if (!code) {
+    $("landingHint").textContent = "Enter the room code they sent you (or paste their invite link).";
+    return;
+  }
+  if (!isPlausibleRoomCode(code)) {
+    $("landingHint").textContent = "That doesn't look like a valid room code — double check what they sent you.";
+    return;
+  }
+  enterRoom(code, name, pin);
+});
+
+// Refreshing the page (accidentally or on purpose) used to always dump you
+// back on the landing screen, even mid-call — you'd have to re-type your
+// name and room code every time. Now the room+name gets remembered, and only
+// clicking "Leave" (below) actually clears it.
+(function autoRejoinOrFillFromInviteLink() {
+  const params = new URLSearchParams(window.location.search);
+  const roomParam = params.get("room");
+  const nameParam = params.get("name");
+
+  // The native Android app already knows the room + name — skip the landing
+  // screen entirely and join straight away.
+  if (NATIVE_MODE && roomParam && nameParam) {
+    enterRoom(normalizeRoomCode(roomParam), decodeURIComponent(nameParam), null);
+    return;
+  }
+
+  const savedRoom = localStorage.getItem("together_last_room");
+  const savedName = localStorage.getItem("together_last_name");
+  const savedPin = localStorage.getItem("together_last_pin");
+
+  // A fresh invite link in the URL always wins over whatever was saved
+  // before (someone might be joining a different room than last time) —
+  // but if we already know their name from before, skip re-typing it.
+  if (roomParam) {
+    const room = normalizeRoomCode(roomParam);
+    if (savedName && isPlausibleRoomCode(room)) {
+      enterRoom(room, savedName, savedRoom === room ? savedPin : null);
+      return;
+    }
+    $("roomCodeInput").value = roomParam;
+    $("landingHint").textContent = isPlausibleRoomCode(room)
+      ? "Invite link detected — just add your name and hit Join room."
+      : "That invite link doesn't look right — double check it with whoever sent it, or enter a room code below.";
+    return;
+  }
+
+  // No link in the URL — this is either a first visit or a refresh mid-room.
+  if (savedRoom && savedName) {
+    enterRoom(savedRoom, savedName, savedPin);
+  }
+})();
+
+// Opening the same room in a second tab on the same device makes the
+// server treat it as a second, entirely separate person — both tabs
+// request camera/mic, both register as "call" peers, and they end up
+// trying to WebRTC-connect to EACH OTHER instead of to the actual other
+// person, which is confusing at best. Rather than blocking a second tab
+// outright (there may be legitimate reasons — testing, restarting a crashed
+// tab), just detect it via a shared localStorage heartbeat and warn clearly.
+function otherTabAlreadyInRoom(id) {
+  try {
+    const raw = localStorage.getItem(`together_tab_${id}`);
+    if (!raw) return false;
+    const { tabId, at } = JSON.parse(raw);
+    return tabId !== TAB_ID && Date.now() - at < 4000;
+  } catch (e) {
+    return false;
+  }
+}
+
+function claimTabPresence(id) {
+  const write = () => {
+    try {
+      localStorage.setItem(`together_tab_${id}`, JSON.stringify({ tabId: TAB_ID, at: Date.now() }));
+    } catch (e) {
+      // localStorage unavailable (private browsing quirks, etc) — the multi-tab
+      // warning just silently won't fire, nothing else depends on it.
+    }
+  };
+  write();
+  clearInterval(tabHeartbeatInterval);
+  tabHeartbeatInterval = setInterval(write, 2000);
+}
+
+function releaseTabPresence(id) {
+  clearInterval(tabHeartbeatInterval);
+  tabHeartbeatInterval = null;
+  try {
+    const raw = localStorage.getItem(`together_tab_${id}`);
+    if (raw && JSON.parse(raw).tabId === TAB_ID) localStorage.removeItem(`together_tab_${id}`);
+  } catch (e) {}
+}
+window.addEventListener("beforeunload", () => { if (roomId) releaseTabPresence(roomId); });
+
+/* ============ ENTER ROOM ============ */
+async function enterRoom(id, name, pin) {
+  roomId = id;
+  myName = name;
+  myPin = pin || null;
+  localStorage.setItem("together_last_room", id);
+  localStorage.setItem("together_last_name", name);
+  if (myPin) localStorage.setItem("together_last_pin", myPin);
+  else localStorage.removeItem("together_last_pin");
+
+  $("landing").classList.add("hidden");
+  $("room").classList.remove("hidden");
+  // The floating account corner button/panel is positioned top-right so it
+  // works from the landing screen — but the room screen already has its own
+  // controls (Just talk / Director's chair / theme swatches / Leave) packed
+  // into that same top-right corner, and the two were sitting exactly on top
+  // of each other, visually hiding the Leave button behind the Log in pill.
+  // Moving the account button to the bottom-right while in a room keeps it
+  // reachable without covering the room's own topbar controls.
+  document.body.classList.add("in-room");
+  document.addEventListener("visibilitychange", handleCallVisibilityChange);
+  $("copyCodeBtn").textContent = roomId;
+
+  const url = new URL(window.location.href);
+  url.search = `?room=${encodeURIComponent(roomId)}`;
+  window.history.replaceState({}, "", url.toString());
+
+  multiTabWarningPending = otherTabAlreadyInRoom(id);
+  claimTabPresence(id);
+
+  if (NATIVE_MODE) {
+    // The native Android app handles camera, mic, call UI, and screen share.
+    // Hide just the call-specific bits here so nothing overlaps/duplicates it,
+    // but keep chat visible since it's no longer reachable via a toggle button.
+    document.querySelector(".call-bubbles").classList.add("hidden");
+    document.querySelector(".call-controls").classList.add("hidden");
+    $("chatPanel").classList.remove("hidden");
+    document.querySelector('.tab[data-source="screenshare"]').classList.add("hidden");
+  } else {
+  try {
+    const result = await acquireLocalMedia((constraints) => navigator.mediaDevices.getUserMedia(constraints));
+    if (result.tracks.length) {
+      localStream = new MediaStream(result.tracks);
+      $("localVideo").srcObject = localStream;
+      startVoiceReactiveGlow(localStream, "glowRingLocal");
+      if (!result.gotVideo) {
+        alert("Camera access wasn't granted — joining with audio only. You can still watch together and talk.");
+      } else if (!result.gotAudio) {
+        alert("Microphone access wasn't granted — joining with camera only (they won't hear you).");
+      }
+    } else {
+      alert("Camera/mic access is needed for the call to work. You can still watch together without it.");
+    }
+  } catch (err) {
+    alert("Camera/mic access is needed for the call to work. You can still watch together without it.");
+  }
+  }
+
+  socketConnectCount = 0;
+  hasReceivedRoomStateBefore = false;
+  // On a slow/flaky connection (3G, a spotty network) the initial handshake
+  // itself can take several seconds — without this, the room UI just sits
+  // there looking inert with no feedback that anything is happening.
+  showServerConnectionBanner("Connecting…");
+  socket = io(SERVER_URL || undefined);
+  wireSocketEvents();
+  socket.emit("join-room", { roomId, name: myName, role: NATIVE_MODE ? "media" : "call", pin: myPin });
+
+  socket.io.on("reconnect_failed", () => {
+    showServerConnectionBanner("Can't reach the server — check your internet connection and try reloading the page.");
+  });
+}
+
+/* ============ SERVER CONNECTION STATUS ============ */
+// This is about the Socket.IO link to our own server (chat/sync/games/etc),
+// NOT the WebRTC call to the other person — that has its own banner/indicator
+// already (connectionBanner / callConnectionDot) further down.
+function showServerConnectionBanner(text, reconnected) {
+  const banner = $("serverConnectionBanner");
+  $("serverConnectionBannerText").textContent = text;
+  banner.classList.toggle("reconnected", !!reconnected);
+  banner.classList.remove("hidden");
+}
+function hideServerConnectionBanner() {
+  $("serverConnectionBanner").classList.add("hidden");
+}
+
+$("copyCodeBtn").addEventListener("click", () => {
+  navigator.clipboard.writeText(roomId).then(() => {
+    const original = $("copyCodeBtn").textContent;
+    $("copyCodeBtn").textContent = "Copied!";
+    setTimeout(() => ($("copyCodeBtn").textContent = original), 1200);
+  });
+});
+
+function inviteLink() {
+  const url = new URL(window.location.href);
+  url.search = `?room=${encodeURIComponent(roomId)}`;
+  return url.toString();
+}
+
+$("copyLinkBtn").addEventListener("click", async () => {
+  const link = inviteLink();
+  const shareData = {
+    title: "Join me on Together",
+    text: "Come watch/call with me on Together — join here:",
+    url: link,
+  };
+
+  // The native share sheet is genuinely useful on phones (Instagram, WhatsApp,
+  // etc are usually installed there and show up automatically). On desktop,
+  // Windows/Edge also technically supports navigator.share(), but its list
+  // is whatever's registered as a Windows share target — things like Teams,
+  // Outlook, Discord — NOT Instagram, since Instagram isn't a desktop app.
+  // So desktop always gets our own popup instead, which has Instagram in it.
+  const isPhone = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+
+  if (isPhone && navigator.share && navigator.canShare && navigator.canShare(shareData)) {
+    try {
+      await navigator.share(shareData);
+    } catch (err) {
+      // user cancelled the native sheet — no error needed
+    }
+    return;
+  }
+
+  $("sharePopup").classList.toggle("hidden");
+});
+
+document.addEventListener("click", (e) => {
+  if (!$("sharePopup").contains(e.target) && e.target !== $("copyLinkBtn")) {
+    $("sharePopup").classList.add("hidden");
+  }
+});
+
+function flashCopied(msg) {
+  const original = $("copyLinkBtn").textContent;
+  $("copyLinkBtn").textContent = msg || "✅ Link copied!";
+  setTimeout(() => ($("copyLinkBtn").textContent = original), 1500);
+}
+
+$("shareWhatsapp").addEventListener("click", () => {
+  window.open(`https://wa.me/?text=${encodeURIComponent("Join me on Together: " + inviteLink())}`, "_blank");
+  $("sharePopup").classList.add("hidden");
+});
+$("shareTwitter").addEventListener("click", () => {
+  window.open(`https://twitter.com/intent/tweet?text=${encodeURIComponent("Join me on Together")}&url=${encodeURIComponent(inviteLink())}`, "_blank");
+  $("sharePopup").classList.add("hidden");
+});
+$("shareInstagram").addEventListener("click", () => {
+  // Instagram has no web share-intent URL for pre-filled text (unlike
+  // WhatsApp/X) — copying the link and opening Instagram is the honest
+  // best option here, rather than a broken deep link.
+  navigator.clipboard.writeText(inviteLink());
+  window.open("https://instagram.com", "_blank");
+  $("sharePopup").classList.add("hidden");
+  flashCopied("✅ Link copied — paste it in a DM!");
+});
+$("shareEmail").addEventListener("click", () => {
+  window.location.href = `mailto:?subject=${encodeURIComponent("Join me on Together")}&body=${encodeURIComponent("Join me on Together: " + inviteLink())}`;
+  $("sharePopup").classList.add("hidden");
+});
+$("shareCopyPlain").addEventListener("click", () => {
+  navigator.clipboard.writeText(inviteLink());
+  $("sharePopup").classList.add("hidden");
+  flashCopied();
+});
+
+/* ============ HOST: RENAME ROOM ============ */
+// The room CODE never changes (it's the invite link) — this is just a
+// friendly label shown next to it, e.g. "Movie night" instead of "reel-8271".
+function applyRoomDisplayName(name) {
+  const el = $("roomDisplayName");
+  if (!el) return;
+  if (name) {
+    el.textContent = name;
+    el.classList.remove("hidden");
+  } else {
+    el.textContent = "";
+    el.classList.add("hidden");
+  }
+}
+function updateRenameButton() {
+  const btn = $("renameRoomBtn");
+  if (!btn) return;
+  btn.classList.toggle("hidden", !isHost);
+}
+const renameBtnEl = $("renameRoomBtn");
+if (renameBtnEl) {
+  renameBtnEl.addEventListener("click", () => {
+    if (!socket) return;
+    const current = $("roomDisplayName").textContent || "";
+    const name = prompt("Name this room (only you and your guest see it):", current);
+    if (name === null) return; // cancelled
+    socket.emit("room-rename", { name: name.trim() });
+  });
+}
+
+/* ============ HOST: KICK ============ */
+// Kicking only makes sense once someone else is actually here, and only
+// the host is allowed to do it — everyone else never sees this button.
+function updateKickButton() {
+  const btn = $("kickBtn");
+  if (!btn) return;
+  const show = isHost && !NATIVE_MODE && !!remoteSocketId;
+  btn.classList.toggle("hidden", !show);
+}
+$("kickBtn").addEventListener("click", () => {
+  if (!remoteSocketId || !socket) return;
+  const name = $("remoteName").textContent || "them";
+  if (!confirm(`Remove ${name} from this room? They'll be disconnected immediately.`)) return;
+  socket.emit("kick-user", { targetId: remoteSocketId });
+});
+
+// On phones (mainly when opened from a home-screen icon or the Android
+// wrapper), there's no browser reload button to fall back on when video/audio
+// gets stuck — e.g. switching to another app briefly to copy a link, then
+// coming back. A full page reload "fixed" it but was overkill: it also wipes
+// out anything not yet submitted (a link half-typed/pasted into a field,
+// the chat scroll position, etc), which is exactly what was being reported —
+// after "Reconnect", whatever they'd just pasted was gone too, because the
+// whole app restarted from scratch underneath it.
+// Fix: reconnect IN PLACE instead — re-grab the camera/mic (the actual
+// hardware can get suspended by the OS while backgrounded, which is why the
+// video was stuck: the track itself had stopped producing frames, not just
+// the video element), swap the fresh tracks into the existing peer
+// connection, and do an ICE restart. Room state, chat, and anything you were
+// mid-typing/pasting are untouched.
+async function softReconnect({ silent = false } = {}) {
+  $("reconnectBtn").disabled = true;
+  // "silent" means: we're just doing routine track-refresh housekeeping
+  // (e.g. coming back from a brief tab/app switch) and the call itself
+  // still looks healthy — don't alarm the user with a banner for that.
+  // Only show "Reconnecting…" when there's an actual problem to report.
+  const callLooksBroken = !pc || pc.connectionState !== "connected";
+  if (!silent || callLooksBroken) {
+    $("connectionBannerText").textContent = "Reconnecting…";
+    $("connectionBanner").classList.remove("hidden");
+  }
+
+  if (!NATIVE_MODE) {
+    try {
+      const oldTracks = localStream ? localStream.getTracks() : [];
+      const result = await acquireLocalMedia((constraints) => navigator.mediaDevices.getUserMedia(constraints));
+      if (result.tracks.length) {
+        const newStream = new MediaStream(result.tracks);
+        if (pc) {
+          result.tracks.forEach((track) => {
+            const sender = pc.getSenders().find((s) => s.track && s.track.kind === track.kind);
+            if (sender) sender.replaceTrack(track).catch(() => {});
+            else pc.addTrack(track, newStream);
+          });
+        }
+        localStream = newStream;
+        $("localVideo").srcObject = newStream;
+        startVoiceReactiveGlow(newStream, "glowRingLocal");
+        // Stop the old tracks only AFTER the new ones are in — stopping
+        // first would briefly leave the other person with no video/audio
+        // at all instead of a clean handoff.
+        oldTracks.forEach((t) => t.stop());
+      }
+    } catch (e) {
+      // Camera/mic re-acquire failed (permission quirk, device busy) — still
+      // worth trying the ICE restart below rather than giving up entirely.
+    }
+  }
+
+  [$("localVideo"), $("remoteVideo")].forEach((v) => {
+    if (v && v.srcObject) v.play().catch(() => {});
+  });
+  if (voiceGlowAudioCtx && voiceGlowAudioCtx.state === "suspended") {
+    voiceGlowAudioCtx.resume().catch(() => {});
+  }
+  if (pc && remoteSocketId && pc.connectionState !== "connected") {
+    reconnectAttempts = 0;
+    attemptReconnect(remoteSocketId);
+  }
+  setTimeout(() => { $("reconnectBtn").disabled = false; }, 2000);
+}
+$("reconnectBtn").addEventListener("click", softReconnect);
+
+$("leaveBtn").addEventListener("click", () => {
+  localStorage.removeItem("together_last_room");
+  localStorage.removeItem("together_last_name");
+  localStorage.removeItem("together_last_pin");
+  window.location.href = window.location.origin + window.location.pathname;
+});
+
+/* ============ JUST TALK MODE ============ */
+// For when neither of you wants to watch/play anything and just wants to
+// talk — clears the movie/game tabs out of the way so the call and chat
+// are the whole screen instead of feeling like leftover unused sections.
+function setJustTalkMode(on) {
+  document.querySelector(".room-grid").classList.toggle("focus-mode", on);
+  $("justTalkBtn").classList.toggle("active", on);
+  $("justTalkBtn").textContent = on ? "🎬 Show movies & games" : "🗨️ Just talk";
+  localStorage.setItem("together_just_talk", on ? "1" : "0");
+}
+$("justTalkBtn").addEventListener("click", () => {
+  const isOn = document.querySelector(".room-grid").classList.contains("focus-mode");
+  setJustTalkMode(!isOn);
+});
+if (localStorage.getItem("together_just_talk") === "1") setJustTalkMode(true);
+
+/* ============ CALL LAYOUT (Just Talk mode) ============ */
+// Purely a local display preference — each person picks their own, same as
+// theme and ring-light color already work independently per screen. Doesn't
+// need to go over the socket at all.
+function setCallLayout(layout) {
+  const bubbles = document.querySelector(".call-bubbles");
+  bubbles.classList.remove("layout-bubbles", "layout-tiles", "layout-spotlight");
+  if (layout !== "bubbles") bubbles.classList.add(`layout-${layout}`);
+  document.querySelectorAll(".layout-swatch").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.layout === layout);
+  });
+  localStorage.setItem("together_call_layout", layout);
+}
+document.querySelectorAll(".layout-swatch").forEach((btn) => {
+  btn.addEventListener("click", () => setCallLayout(btn.dataset.layout));
+});
+setCallLayout(localStorage.getItem("together_call_layout") || "bubbles");
+
+/* ============ DIRECTOR'S CHAIR ============ */
+// Every video-action we send goes through here so lastKnownVideoState always
+// reflects the freshest state we know about — needed to revert a blocked
+// local play/pause/seek back to what it should be.
+function emitVideoAction(action) {
+  lastKnownVideoState = { ...lastKnownVideoState, ...action };
+  socket.emit("video-action", action);
+}
+
+function isPlaybackLocked() {
+  return !!(directorId && socket && directorId !== socket.id);
+}
+
+// Playback controls (native YT/video-element/Spotify events, the scrubber)
+// have already happened locally by the time their event fires — so a
+// blocked attempt gets silently reverted back to the last official state
+// instead of broadcast, and the person gets a toast explaining why.
+function revertPlaybackIfLocked() {
+  if (!isPlaybackLocked()) return false;
+  if (lastKnownVideoState) applyRemoteVideoState(lastKnownVideoState, false);
+  showDirectorToast(`${directorName || "They"} has the director's chair — only they control play/pause/seek right now.`);
+  return true;
+}
+
+let directorToastTimeout = null;
+function showDirectorToast(msg) {
+  let el = document.getElementById("directorToast");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "directorToast";
+    el.className = "director-toast";
+    document.body.appendChild(el);
+  }
+  el.textContent = msg;
+  el.classList.add("show");
+  clearTimeout(directorToastTimeout);
+  directorToastTimeout = setTimeout(() => el.classList.remove("show"), 2200);
+}
+
+function applyDirectorState(director) {
+  directorId = director ? director.id : null;
+  directorName = director ? director.name : null;
+  const amDirector = !!(directorId && socket && directorId === socket.id);
+  const btn = $("directorBtn");
+  btn.classList.toggle("mine", amDirector);
+  btn.classList.toggle("theirs", !!directorId && !amDirector);
+  if (amDirector) {
+    btn.textContent = "🎬 You're directing — tap to release";
+    btn.title = "Only you control play/pause/seek right now. Tap to open it back up to both of you.";
+  } else if (directorId) {
+    btn.textContent = `🎬 ${directorName} is directing`;
+    btn.title = `${directorName} has the director's chair right now.`;
+  } else {
+    btn.textContent = "🎬 Director's chair";
+    btn.title = "Lock play/pause/seek to just one of you";
+  }
+  $("scrubberInput").disabled = !!directorId && !amDirector;
+  $("filmstrip").classList.toggle("locked-out", !!directorId && !amDirector);
+}
+
+$("directorBtn").addEventListener("click", () => {
+  const amDirector = !!(directorId && socket && directorId === socket.id);
+  if (directorId && !amDirector) {
+    showDirectorToast(`${directorName} already has the director's chair.`);
+    return;
+  }
+  socket.emit("director-set", { take: !amDirector });
+});
+
+/* ============ WATCHLIST ============ */
+function renderWatchlist(list) {
+  const el = $("watchlistItems");
+  el.innerHTML = "";
+  if (!list || list.length === 0) {
+    el.innerHTML = '<p class="watchlist-empty">Nothing queued yet — paste a link above, or queue what\'s currently loaded.</p>';
+    return;
+  }
+  list.forEach((item) => {
+    const row = document.createElement("div");
+    row.className = "watchlist-item";
+    const icon = item.type === "spotify" ? "🎵" : item.type === "upload" ? "📁" : "▶️";
+    row.innerHTML = `<span class="wl-icon">${icon}</span><span class="wl-title">${escapeHtml(item.title)}</span><span class="wl-by">${escapeHtml(item.addedBy)}</span><button class="wl-play" title="Play for both">▶</button><button class="wl-remove" title="Remove">✕</button>`;
+    row.querySelector(".wl-play").addEventListener("click", () => playWatchlistItem(item));
+    row.querySelector(".wl-remove").addEventListener("click", () => socket.emit("watchlist-remove", { id: item.id }));
+    el.appendChild(row);
+  });
+}
+
+function playWatchlistItem(item) {
+  switchToTab(item.type === "spotify" ? "spotify" : item.type === "upload" ? "upload" : "youtube");
+  if (item.type === "youtube") {
+    ensureYoutubePlayer(item.source, () => emitVideoAction({ type: "youtube", source: item.source, isPlaying: false, currentTime: 0 }));
+  } else if (item.type === "spotify") {
+    const [spType, spId] = item.source.split(":");
+    ensureSpotifyPlayer({ type: spType, id: spId }, () => emitVideoAction({ type: "spotify", source: item.source, isPlaying: false, currentTime: 0 }));
+  } else if (item.type === "upload") {
+    loadUploadedVideo(item.source);
+    emitVideoAction({ type: "upload", source: item.source, isPlaying: false, currentTime: 0 });
+  }
+}
+
+function addLinkToWatchlist() {
+  const raw = $("watchlistUrlInput").value.trim();
+  if (!raw) return;
+  const ytId = extractYoutubeId(raw);
+  const ytPlaylistId = !ytId ? extractYoutubePlaylistId(raw) : null;
+  const spUri = extractSpotifyUri(raw);
+  if (ytId) {
+    socket.emit("watchlist-add", { type: "youtube", source: ytId, title: raw });
+  } else if (ytPlaylistId) {
+    socket.emit("watchlist-add", { type: "youtube", source: { playlistId: ytPlaylistId }, title: raw });
+  } else if (spUri) {
+    socket.emit("watchlist-add", { type: "spotify", source: `${spUri.type}:${spUri.id}`, title: raw });
+  } else {
+    alert("That doesn't look like a YouTube or Spotify link.");
+    return;
+  }
+  $("watchlistUrlInput").value = "";
+}
+$("watchlistAddBtn").addEventListener("click", addLinkToWatchlist);
+$("watchlistUrlInput").addEventListener("keydown", (e) => { if (e.key === "Enter") addLinkToWatchlist(); });
+
+$("queueCurrentBtn").addEventListener("click", () => {
+  if (!loadedMediaType || !loadedSourceId) {
+    alert("Nothing's loaded yet to queue.");
+    return;
+  }
+  const defaultTitle = loadedMediaType === "youtube" ? "YouTube video" : loadedMediaType === "spotify" ? "Spotify track" : "Uploaded clip";
+  const title = prompt("Title for this queue item? (optional)", defaultTitle) || defaultTitle;
+  socket.emit("watchlist-add", { type: loadedMediaType, source: loadedSourceId, title });
+});
+
+/* ============ SOCKET EVENTS ============ */
+function wireSocketEvents() {
+  // A network blip (wifi drop, switching networks, phone locking) kills the
+  // Socket.IO transport. socket.io's client reconnects on its own by
+  // default, but the RECONNECTED socket almost always gets a brand-new
+  // socket.id — as far as the server is concerned that's a stranger who
+  // never ran "join-room", so chat/sync/games silently stop working even
+  // though the page looks fine, until someone does a full reload. The fix:
+  // detect a real reconnect (2nd+ "connect" event) and re-announce
+  // ourselves, which also makes the server resend fresh "room-state" so
+  // we land back in sync instead of just rejoining blind.
+  socket.on("connect", () => {
+    socketConnectCount++;
+    hideServerConnectionBanner();
+    if (socketConnectCount > 1) {
+      socket.emit("join-room", { roomId, name: myName, role: NATIVE_MODE ? "media" : "call", pin: myPin });
+      showServerConnectionBanner("Back online — you're resynced.", true);
+      setTimeout(hideServerConnectionBanner, 2500);
+    } else if (multiTabWarningPending) {
+      multiTabWarningPending = false;
+      showServerConnectionBanner("Heads up — this room is already open in another tab on this device. Camera/mic and the call can get confused with two tabs open; closing one is usually best.");
+      setTimeout(hideServerConnectionBanner, 8000);
+    }
+  });
+
+  socket.on("disconnect", () => {
+    showServerConnectionBanner("Connection lost — reconnecting…");
+  });
+
+  socket.io.on("reconnect_attempt", (attempt) => {
+    showServerConnectionBanner(
+      attempt <= 2 ? "Connection lost — reconnecting…" : "Still trying to reconnect — check your internet connection…"
+    );
+  });
+
+  socket.on("room-expired", () => {
+    localStorage.removeItem("together_last_room");
+    localStorage.removeItem("together_last_name");
+    localStorage.removeItem("together_last_pin");
+    alert("This room's link has expired (links are valid for 24 hours) — you'll need a fresh invite link or to start a new room.");
+    window.location.href = window.location.origin + window.location.pathname;
+  });
+
+  // ---- QA fix: Auth & Access #7 — private room PIN was wrong/missing ----
+  socket.on("join-denied", ({ reason }) => {
+    localStorage.removeItem("together_last_room");
+    localStorage.removeItem("together_last_name");
+    localStorage.removeItem("together_last_pin");
+    const msg =
+      reason === "wrong-pin"
+        ? "That PIN doesn't match this room. Ask them to double check it, or create a new room."
+        : reason === "rate-limited"
+        ? "Too many join attempts from your connection — wait a minute and try again."
+        : reason === "room-full"
+        ? "That room's already full."
+        : "Couldn't join that room.";
+    alert(msg);
+    window.location.href = window.location.origin + window.location.pathname;
+  });
+
+  // ---- QA fix: Auth & Access #4 — the host removed you ----
+  socket.on("kicked", () => {
+    localStorage.removeItem("together_last_room");
+    localStorage.removeItem("together_last_name");
+    localStorage.removeItem("together_last_pin");
+    alert("The host removed you from this room.");
+    window.location.href = window.location.origin + window.location.pathname;
+  });
+
+  socket.on("room-state", ({ video, chat, theme, peers, game, director, watchlist, hostId, isHost: iAmHost, displayName }) => {
+    applyTheme(theme);
+    // Only replay chat history the FIRST time — on a reconnect this same
+    // event fires again with the same history, and every message in it is
+    // already sitting in the DOM from before the drop. Re-appending them
+    // was duplicating the entire chat log every time the connection blipped.
+    if (!hasReceivedRoomStateBefore) chat.forEach(renderChatMessage);
+    hasReceivedRoomStateBefore = true;
+    if (video && video.type) applyRemoteVideoState(video, true);
+    applyDirectorState(director || null);
+    renderWatchlist(watchlist || []);
+    amHost = peers.length === 0; // nobody was here yet -> I'm first -> I "host" any game we start
+    isHost = !!iAmHost;
+    updateKickButton();
+    updateRenameButton();
+    applyRoomDisplayName(displayName);
+    if (game && game.id) applyRemoteGameState(game, true);
+    if (!NATIVE_MODE && peers.length > 0) {
+      remoteSocketId = peers[0].id;
+      $("remoteName").textContent = peers[0].name;
+      startPeerConnection(true, remoteSocketId);
+      startTogetherTimer();
+      updateKickButton();
+    }
+  });
+
+  socket.on("room-renamed", ({ displayName }) => applyRoomDisplayName(displayName));
+
+  socket.on("host-update", ({ hostId }) => {
+    isHost = hostId === socket.id;
+    updateKickButton();
+    updateRenameButton();
+  });
+
+  if (!NATIVE_MODE) {
+    socket.on("peer-joined", ({ id, name }) => {
+      remoteSocketId = id;
+      $("remoteName").textContent = name;
+      startPeerConnection(false, id); // we are the existing peer -> we initiate the offer
+      startTogetherTimer();
+      updateKickButton();
+    });
+
+    socket.on("peer-left", ({ id }) => {
+      // This event used to be treated as "someone left, period" — but if
+      // you leave and rejoin quickly, the "you left" event for your OLD
+      // connection can arrive AFTER the "you joined" event for your NEW
+      // one (network/event ordering isn't guaranteed across two different
+      // socket connections). That stale old event was tearing down the
+      // brand new connection it had nothing to do with — which is exactly
+      // why the other person stayed stuck on "Waiting for them" even
+      // though you'd already rejoined. Only react if it's actually about
+      // whoever we're currently connected to.
+      if (id !== remoteSocketId) return;
+
+      remoteSocketId = null;
+      $("remoteName").textContent = "Waiting for them…";
+      $("glowRingRemote").classList.remove("connected");
+      $("glowRingLocal").classList.remove("connected");
+      $("remoteVideo").srcObject = null;
+      $("remoteUnmuteBtn").classList.add("hidden");
+      if (pc) {
+        pc.close();
+        pc = null;
+      }
+      currentPcTargetId = null;
+      stopTogetherTimer();
+
+      // Bug found here: a live screen share was left completely untouched
+      // when the other person disconnected — the last frame just stayed
+      // frozen on screen forever with nothing telling you they were gone.
+      // Two cases, since `screenShareActive` covers both directions:
+      if (screenStream) {
+        // We were the one sharing — there's no one left to share to, so
+        // release the capture and reset the button/label instead of quietly
+        // still recording the screen in the background.
+        stopScreenShare();
+      } else if (screenShareActive) {
+        // They were sharing to us — their feed just died along with the
+        // connection, so clear it rather than leaving a frozen still frame.
+        screenShareActive = false;
+        $("screenShareVideo").srcObject = null;
+        $("screenShareLabel").textContent = "";
+        refreshMediaVisibility();
+      }
+      updateKickButton();
+    });
+
+    socket.on("signal", async ({ from, data }) => {
+      if (!pc) startPeerConnection(false, from);
+      try {
+        if (data.type === "offer" || data.type === "answer") {
+          const offerCollision = data.type === "offer" && (makingOffer || pc.signalingState !== "stable");
+          ignoreOffer = !isPolite && offerCollision;
+          if (ignoreOffer) return; // the impolite side just ignores a colliding offer — the polite side will back off instead
+
+          if (offerCollision) {
+            // We're polite and mid-offer ourselves — withdraw our own offer
+            // first so accepting theirs doesn't throw (this was the
+            // unguarded exception that silently killed track exchange).
+            await pc.setLocalDescription({ type: "rollback" });
+          }
+          await pc.setRemoteDescription(new RTCSessionDescription(data));
+
+          if (data.type === "offer") {
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            socket.emit("signal", { to: from, data: pc.localDescription });
+          }
+        } else if (data.candidate) {
+          try {
+            await pc.addIceCandidate(data.candidate);
+          } catch (e) {
+            if (!ignoreOffer) throw e;
+          }
+        }
+      } catch (err) {
+        console.error("Signal handling error:", err);
+      }
+    });
+
+    socket.on("media-status", ({ muted, screenshareBackgrounded }) => {
+      if (typeof muted !== "undefined") {
+        $("remoteMicBadge").classList.toggle("hidden", !muted);
+      }
+      if (typeof screenshareBackgrounded !== "undefined") {
+        $("screenShareLabel").classList.remove("hidden");
+        $("screenShareLabel").textContent = screenshareBackgrounded
+          ? `${$("remoteName").textContent} switched apps — sharing is paused until they come back to this tab`
+          : `${$("remoteName").textContent}'s screen`;
+        $("screenShareVideo").classList.toggle("frozen", !!screenshareBackgrounded);
+      }
+    });
+  }
+
+  socket.on("video-action", (state) => applyRemoteVideoState(state, false));
+  socket.on("sync-ping", applySyncPing);
+  socket.on("director-update", applyDirectorState);
+  socket.on("watchlist-update", renderWatchlist);
+  socket.on("chat-message", renderChatMessage);
+  socket.on("reaction", ({ emoji }) => spawnFloatingEmoji(emoji));
+
+  socket.on("caption", ({ text }) => {
+    showCaption("remoteCaption", text);
+    clearTimeout(remoteCaptionClearTimer);
+    remoteCaptionClearTimer = setTimeout(() => showCaption("remoteCaption", ""), 4500);
+  });
+
+  socket.on("icebreaker", ({ text }) => {
+    $("icebreakerText").textContent = `💡 ${text}`;
+    $("icebreakerBanner").classList.remove("hidden");
+  });
+
+  socket.on("moment", renderMoment);
+  socket.on("theme-change", ({ theme }) => applyTheme(theme));
+
+  socket.on("game-select", (game) => {
+    applyRemoteGameState(game, false);
+    switchToTab("games"); // a freshly-started game is worth jumping to, like an incoming screen share
+  });
+  socket.on("game-action", (state) => applyRemoteGameState({ id: currentGame, state }, false));
+  socket.on("draw-stroke", (stroke) => drawStrokeOnCanvas(stroke, false));
+  socket.on("draw-clear", () => clearCanvasLocal(false));
+}
+
+/* ============ MOBILE AUTOPLAY FALLBACK ============ */
+// Mobile browsers (Chrome/Android, Safari/iOS) commonly block autoplay of
+// *unmuted* video without a prior tap on the page — even though the
+// `autoplay` attribute is set. Muted video is always allowed to autoplay,
+// which is why your own camera preview (already muted) shows up fine while
+// the incoming call/screen-share video silently doesn't. This plays muted
+// first (always succeeds), then tries to unmute; if the browser still
+// blocks sound, it shows a one-tap button, and tapping it counts as a real
+// user gesture so playback-with-sound can proceed.
+function playWithUnmuteFallback(videoEl, unmuteBtn) {
+  videoEl.play().catch(() => {
+    videoEl.muted = true;
+    videoEl.play().catch(() => {});
+    unmuteBtn.classList.remove("hidden");
+  });
+}
+
+function wireUnmuteButton(btnId, videoId) {
+  $(btnId).addEventListener("click", () => {
+    const videoEl = $(videoId);
+    videoEl.muted = false;
+    videoEl.play().catch(() => {});
+    $(btnId).classList.add("hidden");
+  });
+}
+wireUnmuteButton("remoteUnmuteBtn", "remoteVideo");
+wireUnmuteButton("screenShareUnmuteBtn", "screenShareVideo");
+wireUnmuteButton("mediaUnmuteBtn", "localVideoPlayer");
+$("ytUnmuteBtn").addEventListener("click", () => {
+  if (ytPlayer && ytPlayer.unMute) ytPlayer.unMute();
+  $("ytUnmuteBtn").classList.add("hidden");
+});
+let isPolite = false;
+let makingOffer = false;
+let ignoreOffer = false;
+let currentPcTargetId = null; // who the current `pc` object actually belongs to
+
+function startPeerConnection(isAnswerer, targetId) {
+  if (pc) {
+    if (currentPcTargetId === targetId) return; // already correctly set up for this exact peer
+    // A connection object exists but it's for a DIFFERENT (likely dead/stale)
+    // peer id — this was the actual mechanism behind "stuck showing the old
+    // video/no voice after a quick refresh+rejoin": the id we're tracking
+    // moves on to the new connection, but nothing ever rebuilt the actual
+    // WebRTC pipe to match, so it kept using a dead connection under a
+    // now-current-looking name. Tear it down and build a fresh one.
+    try { pc.close(); } catch (e) {}
+    pc = null;
+  }
+  currentPcTargetId = targetId;
+  pc = new RTCPeerConnection({ iceServers: ICE_SERVERS, iceCandidatePoolSize: 10 });
+
+  // Real bug found here: two people can easily trigger a renegotiation at
+  // almost the same moment (classic case: someone starts screen share right
+  // as a reconnect/ICE-restart is also in flight). With no tiebreaker, both
+  // sides would call setRemoteDescription on an offer while ALSO having a
+  // pending local offer of their own — which throws, and that throw wasn't
+  // even being caught, so the whole renegotiation silently died. That's the
+  // direct mechanism behind "one side has picture/sound, the other doesn't."
+  // Fix: give every pair a consistent, deterministic "polite" side (lower
+  // socket id) that backs off and rolls back its own offer on collision; the
+  // other side just proceeds. Both sides always agree on who yields, so
+  // there's nothing left to race.
+  isPolite = socket.id < targetId;
+
+  if (localStream) {
+    localStream.getTracks().forEach((track) => {
+      const sender = pc.addTrack(track, localStream);
+      if (track.kind === "video") boostVideoBitrate(sender);
+    });
+  }
+
+  pc.onicecandidate = (e) => {
+    if (e.candidate) socket.emit("signal", { to: targetId, data: { candidate: e.candidate } });
+  };
+
+  // Distinguish "the camera+mic call stream" from "a screen-share stream" by
+  // MediaStream identity, not by which track (audio/video) happens to fire
+  // ontrack first — audio and video tracks from the same call don't have a
+  // guaranteed arrival order, and the old kind==="video" check misfired
+  // whenever audio arrived first, misrouting the whole call stream into the
+  // screen-share slot (which is why voice could work with no picture).
+  let remoteCallStreamId = null;
+  pc.ontrack = (e) => {
+    const incomingStream = e.streams[0];
+    if (!incomingStream) return;
+
+    // Whichever track (audio or video) shows up first from the call defines
+    // the call stream's identity for every track that follows.
+    if (!remoteCallStreamId) remoteCallStreamId = incomingStream.id;
+
+    if (incomingStream.id === remoteCallStreamId) {
+      $("remoteVideo").srcObject = incomingStream;
+      $("glowRingRemote").classList.add("connected");
+      $("glowRingLocal").classList.add("connected");
+      startVoiceReactiveGlow(incomingStream, "glowRingRemote");
+      playWithUnmuteFallback($("remoteVideo"), $("remoteUnmuteBtn"));
+    } else {
+      // Any stream that isn't the original call stream is a screen share.
+      screenShareActive = true;
+      refreshMediaVisibility();
+      $("screenShareVideo").srcObject = incomingStream;
+      $("screenShareVideo").muted = false;
+      $("screenShareLabel").textContent = `${$("remoteName").textContent}'s screen`;
+      switchToTab("screenshare");
+      playWithUnmuteFallback($("screenShareVideo"), $("screenShareUnmuteBtn"));
+
+      const vTrack = incomingStream.getVideoTracks()[0];
+      if (vTrack) {
+        vTrack.onended = () => {
+          screenShareActive = false;
+          $("screenShareVideo").srcObject = null;
+          refreshMediaVisibility();
+        };
+      }
+    }
+  };
+
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState === "connected") {
+      reconnectAttempts = 0;
+      setConnectionIndicator("good");
+      $("connectionBanner").classList.add("hidden");
+    }
+    if (pc.connectionState === "disconnected") {
+      $("glowRingRemote").classList.remove("connected");
+      $("glowRingLocal").classList.remove("connected");
+      setConnectionIndicator("poor");
+      // Brief drops often self-heal (a few seconds of bad wifi); only force
+      // a reconnect if it's still down a moment later.
+      setTimeout(() => {
+        if (pc && pc.connectionState === "disconnected") attemptReconnect(targetId);
+      }, 3000);
+    }
+    if (pc.connectionState === "failed") {
+      $("glowRingRemote").classList.remove("connected");
+      $("glowRingLocal").classList.remove("connected");
+      setConnectionIndicator("poor");
+      attemptReconnect(targetId);
+    }
+  };
+
+  if (!isAnswerer) {
+    // We were already in the room; the newcomer needs an offer from us.
+    makingOffer = true;
+    pc.createOffer()
+      .then((offer) => pc.setLocalDescription(offer))
+      .then(() => socket.emit("signal", { to: targetId, data: pc.localDescription }))
+      .catch((err) => console.error("Initial offer failed:", err))
+      .finally(() => (makingOffer = false));
+  }
+}
+
+/* ============ CALL QUALITY ============ */
+let reconnectAttempts = 0;
+
+// Browsers default to fairly conservative video bitrates that can make a
+// 720p call look worse than it needs to on a decent connection — this raises
+// the ceiling so quality isn't left on the table when bandwidth allows it.
+async function boostVideoBitrate(sender, maxBitrate = 2_500_000) {
+  try {
+    const params = sender.getParameters();
+    if (!params.encodings) params.encodings = [{}];
+    params.encodings[0].maxBitrate = maxBitrate;
+    await sender.setParameters(params);
+  } catch (e) {
+    // Some browsers don't support setParameters before the first negotiation — harmless if so.
+  }
+}
+
+// Mobile browsers commonly suspend video decode AND the camera/mic hardware
+// itself while the tab/app sits in the background (switching apps briefly to
+// copy a link, locking the screen) — a quick .play() doesn't help if the
+// underlying track has actually stopped producing frames. A short glance
+// away rarely causes real damage, so only run the heavier camera-reacquire +
+// ICE-restart path (the same one Reconnect uses) after a longer stint,
+// rather than on every brief tab switch.
+let lastHiddenAt = null;
+function handleCallVisibilityChange() {
+  if (document.visibilityState === "hidden") {
+    lastHiddenAt = Date.now();
+    return;
+  }
+  const wasHiddenForMs = lastHiddenAt ? Date.now() - lastHiddenAt : 0;
+  [$("localVideo"), $("remoteVideo")].forEach((v) => {
+    if (v && v.srcObject) v.play().catch(() => {});
+  });
+  if (voiceGlowAudioCtx && voiceGlowAudioCtx.state === "suspended") {
+    voiceGlowAudioCtx.resume().catch(() => {});
+  }
+  if (wasHiddenForMs > 2000) {
+    softReconnect({ silent: !!pc && pc.connectionState === "connected" });
+  } else if (pc && pc.connectionState !== "connected" && remoteSocketId) {
+    attemptReconnect(remoteSocketId);
+  }
+}
+
+function attemptReconnect(targetId) {
+  if (!pc) return;
+  if (reconnectAttempts >= 5) {
+    // Automatic retries gave up — this usually means the shared free TURN
+    // relay is congested/unreachable right now, or one side's network is
+    // blocking relay traffic outright. Give a manual way to try again
+    // instead of silently staying broken forever.
+    $("connectionBannerText").textContent =
+      "Still can't connect their video/audio — this can happen on some networks. Try Retry, or have both of you reload the page.";
+    $("connectionBanner").classList.remove("hidden");
+    return;
+  }
+  reconnectAttempts++;
+  const delay = Math.min(1000 * 2 ** reconnectAttempts, 15000); // exponential backoff, capped at 15s
+  setTimeout(async () => {
+    if (!pc || pc.connectionState === "connected") return;
+    try {
+      makingOffer = true;
+      const offer = await pc.createOffer({ iceRestart: true });
+      await pc.setLocalDescription(offer);
+      socket.emit("signal", { to: targetId, data: pc.localDescription });
+    } catch (e) {
+    } finally {
+      makingOffer = false;
+    }
+  }, delay);
+}
+
+$("connectionRetryBtn").addEventListener("click", () => {
+  $("connectionBanner").classList.add("hidden");
+  reconnectAttempts = 0;
+  if (remoteSocketId) attemptReconnect(remoteSocketId);
+});
+
+function setConnectionIndicator(level) {
+  const dot = $("callConnectionDot");
+  if (!dot) return;
+  dot.classList.remove("quality-good", "quality-poor", "quality-connecting");
+  dot.classList.add(`quality-${level}`);
+  dot.title =
+    level === "good" ? "Connection is solid" : level === "poor" ? "Connection is unstable — reconnecting…" : "Connecting…";
+}
+
+// Lightweight polling of real transport stats (packet loss + round-trip time)
+// so "the call feels laggy" has an actual number behind it instead of a guess.
+setInterval(async () => {
+  if (!pc || pc.connectionState !== "connected") return;
+  try {
+    const stats = await pc.getStats();
+    let packetsLost = 0;
+    let packetsReceived = 0;
+    let rtt = 0;
+    stats.forEach((report) => {
+      if (report.type === "inbound-rtp" && report.kind === "video") {
+        packetsLost += report.packetsLost || 0;
+        packetsReceived += report.packetsReceived || 0;
+      }
+      if (report.type === "candidate-pair" && report.state === "succeeded" && report.currentRoundTripTime) {
+        rtt = report.currentRoundTripTime;
+      }
+    });
+    const lossRatio = packetsReceived > 0 ? packetsLost / (packetsLost + packetsReceived) : 0;
+    if (lossRatio > 0.05 || rtt > 0.4) setConnectionIndicator("poor");
+    else setConnectionIndicator("good");
+  } catch (e) {}
+}, 5000);
+
+/* ============ TOGETHER TIMER ============ */
+function startTogetherTimer() {
+  if (togetherInterval) return;
+  togetherInterval = setInterval(() => {
+    togetherSeconds++;
+    const m = String(Math.floor(togetherSeconds / 60)).padStart(2, "0");
+    const s = String(togetherSeconds % 60).padStart(2, "0");
+    $("togetherTimer").textContent = `${m}:${s}`;
+  }, 1000);
+}
+function stopTogetherTimer() {
+  clearInterval(togetherInterval);
+  togetherInterval = null;
+}
+
+/* ============ CALL CONTROLS ============ */
+$("micBtn").addEventListener("click", () => {
+  if (!localStream) return;
+  const track = localStream.getAudioTracks()[0];
+  if (!track) return;
+  track.enabled = !track.enabled;
+  $("micBtn").classList.toggle("off", !track.enabled);
+  $("localMicBadge").classList.toggle("hidden", track.enabled);
+  socket && socket.emit("media-status", { muted: !track.enabled });
+});
+$("camBtn").addEventListener("click", () => {
+  if (!localStream) return;
+  const track = localStream.getVideoTracks()[0];
+  if (!track) return;
+  track.enabled = !track.enabled;
+  $("camBtn").classList.toggle("off", !track.enabled);
+});
+$("chatToggleBtn").addEventListener("click", () => $("chatPanel").classList.toggle("hidden"));
+
+// On mobile, the on-screen keyboard opening resizes the visible viewport,
+// and the browser's own default "scroll the focused input into view" can
+// fire mid-animation (before the keyboard has finished sliding up),
+// landing in the wrong spot and making the Send button appear to jump.
+// Waiting until the keyboard's resize has actually settled (via
+// visualViewport's resize event, with a fallback delay for browsers that
+// don't support it) and then doing our own smooth, centered scroll gives
+// one deliberate settle instead of a jarring one.
+function settleChatInputIntoView() {
+  const scrollIntoView = () => $("chatForm").scrollIntoView({ behavior: "smooth", block: "center" });
+  if (window.visualViewport) {
+    const onResize = () => {
+      scrollIntoView();
+      window.visualViewport.removeEventListener("resize", onResize);
+    };
+    window.visualViewport.addEventListener("resize", onResize);
+    // Safety net in case the keyboard was already open (no resize fires).
+    setTimeout(() => window.visualViewport.removeEventListener("resize", onResize), 600);
+  }
+  setTimeout(scrollIntoView, 300);
+}
+$("chatInput").addEventListener("focus", settleChatInputIntoView);
+
+/* ============ EMOJI DRAWER (Gboard-style, next to Send) ============ */
+const EMOJI_CATEGORIES = {
+  "Recent": [],
+  "😀": ["😀","😁","😂","🤣","😊","😍","🥰","😘","😉","😎","🤩","🥳","😇","🙂","🙃","😜","🤪","😏","😴","🤔","😮","😢","😭","😅","😬","🙄","😳","🥺","😤","😡","🤗","🤭"],
+  "❤️": ["❤️","🧡","💛","💚","💙","💜","🖤","🤍","💕","💞","💓","💗","💖","💘","💝","💔","😻","💋","😽","🫶"],
+  "👍": ["👍","👎","👏","🙌","👋","🤝","🙏","💪","✌️","🤞","👌","🤟","🤙","👆","👉","👈","✋","👀","🫡","🤌"],
+  "🐶": ["🐶","🐱","🐭","🐹","🐰","🦊","🐻","🐼","🐨","🐯","🦁","🐷","🐸","🐵","🐔","🐧","🐦","🐢","🐬","🦋"],
+  "🍔": ["🍏","🍎","🍊","🍋","🍌","🍉","🍇","🍓","🍒","🍑","🍕","🍔","🍟","🌭","🍿","🍩","🍪","🍫","🍰","☕"],
+  "⚽": ["⚽","🏀","🏈","🎮","🎬","🎧","🎤","🎨","🎲","🎉","🎈","🔥","✨","⭐","💯","🏆","🎁","📺","🍿","🕹️"],
+};
+const EMOJI_RECENT_KEY = "together_recent_emoji";
+function getRecentEmoji() {
+  try { return JSON.parse(localStorage.getItem(EMOJI_RECENT_KEY) || "[]"); } catch { return []; }
+}
+function pushRecentEmoji(e) {
+  const recent = getRecentEmoji().filter((x) => x !== e);
+  recent.unshift(e);
+  localStorage.setItem(EMOJI_RECENT_KEY, JSON.stringify(recent.slice(0, 24)));
+}
+function renderEmojiGrid(cat) {
+  const grid = $("emojiDrawerGrid");
+  const list = cat === "Recent" ? getRecentEmoji() : EMOJI_CATEGORIES[cat];
+  grid.innerHTML = "";
+  if (!list.length) {
+    grid.innerHTML = `<span class="emoji-drawer-empty">No recent emoji yet — pick a few!</span>`;
+    return;
+  }
+  list.forEach((e) => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "emoji-option";
+    btn.textContent = e;
+    btn.addEventListener("click", () => {
+      const input = $("chatInput");
+      const start = input.selectionStart ?? input.value.length;
+      const end = input.selectionEnd ?? input.value.length;
+      input.value = input.value.slice(0, start) + e + input.value.slice(end);
+      input.focus();
+      input.selectionStart = input.selectionEnd = start + e.length;
+      pushRecentEmoji(e);
+      if ($("emojiDrawerTabs").dataset.active === "Recent") renderEmojiGrid("Recent");
+    });
+    grid.appendChild(btn);
+  });
+}
+function setEmojiTab(cat) {
+  $("emojiDrawerTabs").dataset.active = cat;
+  document.querySelectorAll(".emoji-tab").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.cat === cat);
+  });
+  renderEmojiGrid(cat);
+}
+function buildEmojiDrawer() {
+  const tabs = $("emojiDrawerTabs");
+  tabs.innerHTML = "";
+  Object.keys(EMOJI_CATEGORIES).forEach((cat) => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "emoji-tab";
+    btn.dataset.cat = cat;
+    btn.textContent = cat === "Recent" ? "🕘" : cat;
+    btn.title = cat === "Recent" ? "Recently used" : "";
+    btn.addEventListener("click", () => setEmojiTab(cat));
+    tabs.appendChild(btn);
+  });
+  setEmojiTab(getRecentEmoji().length ? "Recent" : "😀");
+}
+buildEmojiDrawer();
+$("emojiToggleBtn").addEventListener("click", () => {
+  const drawer = $("emojiDrawer");
+  const opening = drawer.classList.contains("hidden");
+  drawer.classList.toggle("hidden");
+  $("emojiToggleBtn").classList.toggle("active", opening);
+  if (opening) {
+    setEmojiTab($("emojiDrawerTabs").dataset.active || "😀");
+    $("chatMessages").scrollTop = $("chatMessages").scrollHeight;
+  }
+});
+$("chatInput").addEventListener("focus", () => {
+  $("emojiDrawer").classList.add("hidden");
+  $("emojiToggleBtn").classList.remove("active");
+});
+
+/* ============ CHAT ============ */
+$("chatForm").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const text = $("chatInput").value.trim();
+  if (!text) return;
+  socket.emit("chat-message", { text });
+  maybeCheckDrawGuess(text);
+  $("chatInput").value = "";
+  $("emojiDrawer").classList.add("hidden");
+  $("emojiToggleBtn").classList.remove("active");
+});
+
+function renderChatMessage(msg) {
+  const div = document.createElement("div");
+  div.className = "chat-msg";
+  div.innerHTML = `<span class="who">${escapeHtml(msg.name)}</span>${escapeHtml(msg.text)}`;
+  $("chatMessages").appendChild(div);
+  $("chatMessages").scrollTop = $("chatMessages").scrollHeight;
+}
+
+function escapeHtml(str) {
+  const d = document.createElement("div");
+  d.textContent = str;
+  return d.innerHTML;
+}
+
+/* ============ SPARK A CONVERSATION (incoming banner) ============ */
+$("icebreakerCloseBtn").addEventListener("click", () => {
+  $("icebreakerBanner").classList.add("hidden");
+});
+
+/* ============ LIVE CAPTIONS ============ */
+// Each side transcribes its OWN microphone locally (the browser's built-in
+// speech recognition never sends your audio to our server — it goes
+// straight to the browser vendor's recognition service, same as any other
+// page using this API) and relays just the resulting TEXT to the other
+// person, the same way a reaction gets relayed.
+const SpeechRecognitionImpl = window.SpeechRecognition || window.webkitSpeechRecognition;
+let captionsOn = false;
+let recognizer = null;
+let localCaptionClearTimer = null;
+let remoteCaptionClearTimer = null;
+
+if (!SpeechRecognitionImpl) {
+  $("captionsBtn").disabled = true;
+  $("captionsBtn").title = "Live captions aren't supported in this browser";
+}
+
+function showCaption(elId, text, clearTimerRef) {
+  const el = $(elId);
+  if (!text) {
+    el.classList.add("hidden");
+    return;
+  }
+  el.textContent = text;
+  el.classList.remove("hidden");
+}
+
+function startCaptions() {
+  recognizer = new SpeechRecognitionImpl();
+  recognizer.continuous = true;
+  recognizer.interimResults = true;
+  recognizer.lang = navigator.language || "en-US";
+
+  recognizer.onresult = (e) => {
+    let interim = "";
+    let final = "";
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const chunk = e.results[i][0].transcript;
+      if (e.results[i].isFinal) final += chunk;
+      else interim += chunk;
+    }
+    if (final.trim()) {
+      showCaption("localCaption", final.trim());
+      socket.emit("caption", { text: final.trim(), final: true });
+      clearTimeout(localCaptionClearTimer);
+      localCaptionClearTimer = setTimeout(() => showCaption("localCaption", ""), 4500);
+    } else if (interim.trim()) {
+      showCaption("localCaption", interim.trim());
+    }
+  };
+  recognizer.onerror = (e) => {
+    // "no-speech" fires constantly during normal silence between sentences —
+    // not an actual error worth reacting to. Permission/device issues are
+    // the ones that should actually turn captions back off.
+    if (e.error === "not-allowed" || e.error === "audio-capture") {
+      alert("Live captions need microphone access — check your browser's permissions.");
+      setCaptionsOn(false);
+    }
+  };
+  recognizer.onend = () => {
+    // Chrome's SpeechRecognition stops itself after periods of silence even
+    // in "continuous" mode — restart it transparently as long as the
+    // person hasn't explicitly turned captions off.
+    if (captionsOn) {
+      try { recognizer.start(); } catch (e) {}
+    }
+  };
+  try {
+    recognizer.start();
+  } catch (e) {
+    setCaptionsOn(false);
+  }
+}
+
+function stopCaptions() {
+  if (recognizer) {
+    recognizer.onend = null; // don't auto-restart on the deliberate stop
+    recognizer.stop();
+    recognizer = null;
+  }
+  showCaption("localCaption", "");
+}
+
+function setCaptionsOn(on) {
+  captionsOn = on;
+  $("captionsBtn").classList.toggle("active", on);
+  if (on) startCaptions();
+  else stopCaptions();
+}
+
+$("captionsBtn").addEventListener("click", () => {
+  if (!SpeechRecognitionImpl) return;
+  setCaptionsOn(!captionsOn);
+});
+
+function spawnFloatingEmoji(emoji) {
+  const el = document.createElement("div");
+  el.className = "floating-emoji";
+  el.textContent = emoji;
+  el.style.left = `${10 + Math.random() * 80}%`;
+  el.style.bottom = `${10 + Math.random() * 10}%`;
+  $("reactionLayer").appendChild(el);
+  setTimeout(() => el.remove(), 2300);
+}
+
+/* ============ MOMENTS ============ */
+$("momentBtn").addEventListener("click", () => {
+  const note = prompt("What's happening right now? (optional note)") || "";
+  const videoTime = getCurrentPlaybackTime();
+  socket.emit("moment", { note, videoTime });
+});
+
+function renderMoment({ note, videoTime, name, at }) {
+  const div = document.createElement("div");
+  div.className = "moment";
+  const timeLabel = formatTime(videoTime || 0);
+  div.innerHTML = `<span class="m-name">${escapeHtml(name)}</span> saved <b>${timeLabel}</b>${note ? " — " + escapeHtml(note) : ""}`;
+  $("momentsList").prepend(div);
+}
+
+function formatTime(sec) {
+  sec = Math.floor(sec || 0);
+  const m = String(Math.floor(sec / 60)).padStart(2, "0");
+  const s = String(sec % 60).padStart(2, "0");
+  return `${m}:${s}`;
+}
+
+/* ============ THEME ============ */
+document.querySelectorAll(".swatch").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    const theme = btn.dataset.theme;
+    applyTheme(theme);
+    socket.emit("theme-change", { theme });
+  });
+});
+
+function applyTheme(theme) {
+  document.documentElement.setAttribute("data-theme", theme);
+  document.querySelectorAll(".swatch").forEach((s) => s.classList.toggle("active", s.dataset.theme === theme));
+}
+
+/* ============ SOURCE TABS ============ */
+document.querySelectorAll(".tab").forEach((tab) => {
+  tab.addEventListener("click", () => {
+    $("sharePopup").classList.add("hidden");
+    document.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
+    tab.classList.add("active");
+    sourceType = tab.dataset.source;
+    $("youtubeControls").classList.toggle("hidden", sourceType !== "youtube");
+    $("uploadControls").classList.toggle("hidden", sourceType !== "upload");
+    $("spotifyControls").classList.toggle("hidden", sourceType !== "spotify");
+    $("screenshareControls").classList.toggle("hidden", sourceType !== "screenshare");
+    $("gamesControls").classList.toggle("hidden", sourceType !== "games");
+    refreshMediaVisibility();
+  });
+});
+
+// The single source of truth for "what's actually on screen right now."
+// Switching tabs used to only toggle the little control bars (search box,
+// upload button, etc) and never touched the actual video/audio/game surface
+// underneath — so the previously-loaded thing just stayed visible (and
+// audible) no matter which tab you clicked. This decides, for the currently
+// selected tab, whether to show that tab's content or the empty state, and
+// makes sure every OTHER surface is hidden so nothing overlaps.
+function refreshMediaVisibility() {
+  const showYoutube = sourceType === "youtube" && loadedMediaType === "youtube";
+  const showUpload = sourceType === "upload" && loadedMediaType === "upload";
+  const showSpotify = sourceType === "spotify" && loadedMediaType === "spotify";
+  const showScreenshare = sourceType === "screenshare" && screenShareActive;
+  const showGames = sourceType === "games" && !!currentGame;
+
+  $("youtubePlayer").classList.toggle("hidden", !showYoutube);
+  $("localVideoPlayer").classList.toggle("hidden", !showUpload);
+  $("spotifyPlayer").classList.toggle("hidden", !showSpotify);
+  $("screenShareVideo").classList.toggle("hidden", !showScreenshare);
+  $("screenShareLabel").classList.toggle("hidden", !showScreenshare);
+  $("screenShareFullscreenBtn").classList.toggle("hidden", !showScreenshare);
+  $("gameArea").classList.toggle("hidden", !showGames);
+  $("youtubeEmbedError").classList.add("hidden"); // only shown right after a failed load attempt
+  $("mediaLoadError").classList.add("hidden"); // only shown right after a failed video load
+  $("spotifyEmbedError").classList.add("hidden"); // only shown right after Spotify's embed fails to load
+  document.querySelector(".screen-frame").classList.toggle("spotify-mode", showSpotify);
+
+  // Hiding a player with CSS doesn't stop it — a hidden YouTube/Spotify/video
+  // element just keeps playing audio behind whatever tab you switched to,
+  // which is what made switching tabs feel broken ("the old thing is still
+  // there"). Actually pause whatever just became hidden.
+  if (!showYoutube && ytPlayer && ytPlayer.pauseVideo) ytPlayer.pauseVideo();
+  if (!showUpload && videoEl && !videoEl.paused) videoEl.pause();
+  if (!showSpotify && spotifyController && spotifyController.pause) spotifyController.pause();
+
+  const somethingShowing = showYoutube || showUpload || showSpotify || showScreenshare || showGames;
+  $("emptyState").classList.toggle("hidden", somethingShowing);
+}
+
+function switchToTab(source) {
+  const tab = document.querySelector(`.tab[data-source="${source}"]`);
+  if (tab) tab.click();
+}
+
+/* ============ YOUTUBE ============ */
+function getYoutubeApiKey() {
+  let key = localStorage.getItem("together_youtube_api_key");
+  if (!key) {
+    key = prompt(
+      "To search YouTube from inside the app, paste a free YouTube Data API key.\n\n" +
+      "Get one in ~2 minutes: console.cloud.google.com → create a project → " +
+      "enable 'YouTube Data API v3' → Credentials → Create API key.\n\n" +
+      "(You can skip this and just paste video links instead, using the option below.)"
+    );
+    if (key) localStorage.setItem("together_youtube_api_key", key.trim());
+  }
+  return key ? key.trim() : null;
+}
+
+$("youtubeKeyHint").innerHTML = 'Searching by keyword needs a free <a href="https://console.cloud.google.com/apis/library/youtube.googleapis.com" target="_blank" rel="noopener">YouTube Data API key</a> — but pasting a link (video, playlist, or a live stream\'s watch link) never needs one, so that\'s the most reliable option.';
+
+$("searchYoutubeBtn").addEventListener("click", () => runYoutubeSearch());
+$("youtubeSearchInput").addEventListener("keydown", (e) => { if (e.key === "Enter") runYoutubeSearch(); });
+
+async function runYoutubeSearch() {
+  const query = $("youtubeSearchInput").value.trim();
+  if (!query) return;
+
+  // If they pasted a link into the search box (instead of the dedicated
+  // "paste a link" field below), just load it — no API key needed for that,
+  // only text search needs one. Checked in this order because a
+  // "watch?v=...&list=..." link has both a video ID and a list ID — we want
+  // to play that single video, not the whole playlist.
+  const pastedVideoId = extractYoutubeId(query);
+  const pastedPlaylistId = !pastedVideoId ? extractYoutubePlaylistId(query) : null;
+  if (pastedVideoId) {
+    $("youtubeSearchResults").classList.add("hidden");
+    ensureYoutubePlayer(pastedVideoId, () => {
+      emitVideoAction({ type: "youtube", source: pastedVideoId, isPlaying: false, currentTime: 0 });
+    });
+    return;
+  }
+  if (pastedPlaylistId) {
+    $("youtubeSearchResults").classList.add("hidden");
+    ensureYoutubePlayer({ playlistId: pastedPlaylistId }, () => {
+      emitVideoAction({ type: "youtube", source: { playlistId: pastedPlaylistId }, isPlaying: false, currentTime: 0 });
+    });
+    return;
+  }
+
+  const key = getYoutubeApiKey();
+  if (!key) return;
+
+  const resultsEl = $("youtubeSearchResults");
+  resultsEl.classList.remove("hidden");
+  resultsEl.innerHTML = "<p class='api-key-hint'>Searching…</p>";
+
+  try {
+    const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=6&q=${encodeURIComponent(query)}&key=${key}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    if (data.error) {
+      // The raw Google error message is usually accurate but jargon-heavy
+      // (e.g. "API key not valid", "requests from referer <empty> are
+      // blocked", "quota exceeded") — translate the common cases so people
+      // don't have to go decode a Google Cloud error to know what to do.
+      const reason = data.error.errors?.[0]?.reason || "";
+      let hint = data.error.message || "check your API key";
+      if (reason === "quotaExceeded" || reason === "dailyLimitExceeded") {
+        hint = "Your API key's free daily search quota is used up (resets at midnight Pacific). Paste a video/playlist link directly instead — that never needs the quota.";
+      } else if (reason === "keyInvalid" || /API key not valid/i.test(hint)) {
+        hint = "That API key isn't valid. Double check you copied it fully, or generate a new one in Google Cloud Console.";
+      } else if (/referer|ip address/i.test(hint)) {
+        hint = "This API key is restricted to a specific website/app in Google Cloud Console. Either remove that restriction, or add this app's address to its allowed list.";
+      } else if (/has not been used|is not enabled|disabled/i.test(hint)) {
+        hint = "The YouTube Data API v3 isn't enabled for this key's project yet — enable it in Google Cloud Console, then try again.";
+      }
+      resultsEl.innerHTML = `<p class="api-key-hint">Search failed: ${escapeHtml(hint)}</p>`;
+      return;
+    }
+    resultsEl.innerHTML = "";
+    (data.items || []).forEach((item) => {
+      const videoId = item.id.videoId;
+      const title = item.snippet.title;
+      const thumb = item.snippet.thumbnails?.default?.url;
+      const row = document.createElement("div");
+      row.className = "search-result";
+      row.innerHTML = `<img src="${thumb}" alt=""><span>${escapeHtml(title)}</span>`;
+      row.addEventListener("click", () => {
+        ensureYoutubePlayer(videoId, () => {
+          emitVideoAction({ type: "youtube", source: videoId, isPlaying: false, currentTime: 0 });
+        });
+        resultsEl.classList.add("hidden");
+      });
+      resultsEl.appendChild(row);
+    });
+  } catch (err) {
+    resultsEl.innerHTML = "<p class='api-key-hint'>Search failed — check your connection or API key.</p>";
+  }
+}
+
+function extractYoutubeId(url) {
+  const m = url.match(/(?:youtu\.be\/|v=|embed\/)([a-zA-Z0-9_-]{11})/);
+  return m ? m[1] : null;
+}
+
+// A pasted "watch?v=...&list=..." link matches extractYoutubeId above just
+// fine (the single video plays, playlist part is ignored). This is only for
+// links that are *just* a playlist — e.g. from YouTube's "Share playlist"
+// button (youtube.com/playlist?list=...) — which have no v= for the other
+// regex to find at all.
+function extractYoutubePlaylistId(url) {
+  const m = url.match(/[?&]list=([a-zA-Z0-9_-]+)/);
+  return m ? m[1] : null;
+}
+
+function onYouTubeIframeAPIReady() {
+  ytReady = true;
+}
+window.onYouTubeIframeAPIReady = onYouTubeIframeAPIReady;
+
+// `source` is either a plain 11-char video ID string, or a
+// { playlistId: "..." } object for a pasted playlist link — the iframe embed
+// can load a whole playlist directly with no YouTube Data API key needed,
+// which is what lets playlist links work at all (see extractYoutubePlaylistId).
+// A youtube "source" is either a plain video id string or a {playlistId}
+// object — compare both shapes correctly instead of a naive === that would
+// always say "different" for two playlist objects (different references)
+// even when they're the same playlist.
+function sameYoutubeSource(a, b) {
+  const aPlaylist = a && typeof a === "object" ? a.playlistId : null;
+  const bPlaylist = b && typeof b === "object" ? b.playlistId : null;
+  if (aPlaylist || bPlaylist) return aPlaylist === bPlaylist;
+  return a === b;
+}
+
+function ensureYoutubePlayer(source, cb, attempt = 0) {
+  const playlistId = source && typeof source === "object" ? source.playlistId : null;
+  const videoId = playlistId ? null : source;
+  loadedMediaType = "youtube";
+  loadedSourceId = playlistId ? { playlistId } : videoId;
+  refreshMediaVisibility();
+  $("ytUnmuteBtn").classList.add("hidden");
+
+  const create = () => {
+    if (ytPlayer) {
+      if (playlistId) ytPlayer.loadPlaylist({ list: playlistId, listType: "playlist" });
+      else ytPlayer.loadVideoById(videoId);
+      if (cb) cb();
+      return;
+    }
+    ytPlayer = new YT.Player("youtubePlayer", {
+      videoId: videoId || undefined,
+      playerVars: playlistId
+        ? { autoplay: 0, controls: 1, rel: 0, listType: "playlist", list: playlistId }
+        : { autoplay: 0, controls: 1, rel: 0 },
+      events: {
+        onReady: () => { if (cb) cb(); },
+        onStateChange: onYoutubeStateChange,
+        onError: (e) => onYoutubeError(e, videoId),
+      },
+    });
+  };
+
+  if (ytReady) {
+    create();
+    return;
+  }
+
+  // If YouTube's iframe API script never calls back (most commonly an ad
+  // blocker or privacy extension silently blocking youtube.com, sometimes
+  // an in-app/webview browser), the old code retried this forever with zero
+  // feedback — it just looked permanently "not loading." ~15 attempts at
+  // 300ms is 4.5s, plenty of time for a normal load; past that, say so.
+  if (attempt > 15) {
+    const box = $("youtubeEmbedError");
+    box.innerHTML =
+      "YouTube isn't loading. This usually means an ad blocker or privacy extension is blocking youtube.com — " +
+      "try disabling it for this site, or open this in a different browser.";
+    box.classList.remove("hidden");
+    $("youtubePlayer").classList.add("hidden");
+    return;
+  }
+  setTimeout(() => ensureYoutubePlayer(source, cb, attempt + 1), 300);
+}
+
+// YouTube error codes 101 and 150 both mean "the uploader disabled playback
+// on other sites" — that's a restriction on YouTube's end, not something any
+// embedding app can work around. Instead of leaving a half-broken "Watch on
+// YouTube" box on screen, show a clear explanation with a direct link out.
+function onYoutubeError(e, videoId) {
+  const code = e && e.data;
+  const box = $("youtubeEmbedError");
+  if (code === 101 || code === 150) {
+    box.innerHTML = `This video can't be played inside the app — the uploader disabled embedding.
+      <a href="https://www.youtube.com/watch?v=${videoId}" target="_blank" rel="noopener">Open it on YouTube instead ↗</a>`;
+  } else {
+    box.innerHTML = `This video couldn't be loaded (YouTube error ${code ?? "unknown"}). Try a different link.`;
+  }
+  box.classList.remove("hidden");
+  $("youtubePlayer").classList.add("hidden");
+}
+
+let lastYtState = null;
+function onYoutubeStateChange(e) {
+  if (suppressSync) return;
+  if (e.data === YT.PlayerState.PLAYING) {
+    if (revertPlaybackIfLocked()) return;
+    emitVideoAction({ type: "youtube", isPlaying: true, currentTime: ytPlayer.getCurrentTime() });
+  } else if (e.data === YT.PlayerState.PAUSED) {
+    if (revertPlaybackIfLocked()) return;
+    emitVideoAction({ type: "youtube", isPlaying: false, currentTime: ytPlayer.getCurrentTime() });
+  }
+}
+
+$("loadYoutubeBtn").addEventListener("click", () => {
+  const url = $("youtubeUrlInput").value.trim();
+  const videoId = extractYoutubeId(url);
+  const playlistId = !videoId ? extractYoutubePlaylistId(url) : null;
+  if (!videoId && !playlistId) {
+    alert("That doesn't look like a valid YouTube video or playlist link.");
+    return;
+  }
+  if (playlistId) {
+    ensureYoutubePlayer({ playlistId }, () => {
+      emitVideoAction({ type: "youtube", source: { playlistId }, isPlaying: false, currentTime: 0 });
+    });
+  } else {
+    ensureYoutubePlayer(videoId, () => {
+      emitVideoAction({ type: "youtube", source: videoId, isPlaying: false, currentTime: 0 });
+    });
+  }
+});
+
+/* ============ SPOTIFY ============ */
+let spotifyController = null;
+let spotifyIframeAPI = null;
+let spotifyLastPosition = 0;
+let spotifyLastDuration = 0;
+
+window.onSpotifyIframeApiReady = (IFrameAPI) => {
+  spotifyIframeAPI = IFrameAPI;
+};
+
+function extractSpotifyUri(url) {
+  // Matches track/album/playlist/episode links like:
+  // https://open.spotify.com/track/{id}?si=...
+  //
+  // Two real gaps in the old regex, both about "invalid URL" handling being
+  // too strict in one direction and too loose in the other:
+  //
+  // 1. Too strict: Spotify's own mobile share sheet ("Copy Link") commonly
+  //    produces locale-prefixed links like
+  //    open.spotify.com/intl-de/track/{id} — the old regex required
+  //    "open.spotify.com/track/" immediately, so a perfectly valid link
+  //    copied straight out of Spotify got rejected with "that doesn't look
+  //    like a valid Spotify link," with no indication why. Now an optional
+  //    "intl-xx/" segment is allowed between the domain and the type.
+  // 2. Too loose: a genuinely malformed id (containing an underscore, for
+  //    example) used to still partially match — "short_id_with_underscore"
+  //    silently became id "short," which would load (or fail to load) an
+  //    unrelated/nonexistent track instead of being rejected outright. Real
+  //    Spotify ids are always exactly 22 base62 characters, so that's now
+  //    enforced instead of matching any run of alphanumerics.
+  const m = url.match(/open\.spotify\.com\/(?:intl-[a-zA-Z-]+\/)?(track|album|playlist|episode)\/([a-zA-Z0-9]{22})(?![a-zA-Z0-9])/);
+  if (!m) return null;
+  return { type: m[1], id: m[2] };
+}
+
+function ensureSpotifyPlayer(uri, cb, attempt = 0) {
+  loadedMediaType = "spotify";
+  loadedSourceId = `${uri.type}:${uri.id}`;
+  refreshMediaVisibility();
+
+  const create = () => {
+    const el = $("spotifyPlayer");
+    el.innerHTML = "";
+    const options = { uri: `spotify:${uri.type}:${uri.id}` };
+    spotifyIframeAPI.createController(el, options, (controller) => {
+      spotifyController = controller;
+      controller.addListener("playback_update", (e) => {
+        spotifyLastPosition = e.data.position / 1000;
+        spotifyLastDuration = e.data.duration / 1000;
+        if (suppressSync) return;
+        if (revertPlaybackIfLocked()) return;
+        emitVideoAction({
+          type: "spotify",
+          isPlaying: !e.data.isPaused,
+          currentTime: e.data.position / 1000,
+        });
+      });
+      if (cb) cb();
+    });
+  };
+
+  if (spotifyIframeAPI) {
+    create();
+    return;
+  }
+
+  // Same gap the YouTube path had before it was fixed: if open.spotify.com is
+  // temporarily unreachable (an outage on Spotify's end, a network blip, or
+  // an ad blocker/privacy extension blocking the embed script) the iframe API
+  // script never loads, onSpotifyIframeApiReady never fires, and this used to
+  // retry every 300ms forever — no error, just a permanently empty player
+  // with the loading state never resolving either way. ~15 attempts at 300ms
+  // is 4.5s, enough time for a normal load; past that, say so instead of
+  // spinning silently.
+  if (attempt > 15) {
+    const box = $("spotifyEmbedError");
+    box.innerHTML =
+      "Spotify isn't loading right now. This usually means Spotify's embed service is " +
+      "temporarily unavailable, or an ad blocker/privacy extension is blocking open.spotify.com — " +
+      "try again in a bit, disable the blocker for this site, or open the link directly in Spotify.";
+    box.classList.remove("hidden");
+    $("spotifyPlayer").classList.add("hidden");
+    return;
+  }
+  setTimeout(() => ensureSpotifyPlayer(uri, cb, attempt + 1), 300);
+}
+
+function applySpotifyPlaybackState(state) {
+  if (!spotifyController) return;
+  const drift = Math.abs(spotifyLastPosition - (state.currentTime || 0));
+  if (drift > 1.5 && spotifyController.seek) spotifyController.seek(state.currentTime || 0);
+  if (state.isPlaying) spotifyController.resume();
+  else spotifyController.pause();
+}
+
+$("loadSpotifyBtn").addEventListener("click", () => {
+  const url = $("spotifyUrlInput").value.trim();
+  const uri = extractSpotifyUri(url);
+  if (!uri) {
+    alert("That doesn't look like a valid Spotify link (track, album, playlist, or episode).");
+    return;
+  }
+  ensureSpotifyPlayer(uri, () => {
+    emitVideoAction({ type: "spotify", source: `${uri.type}:${uri.id}`, isPlaying: false, currentTime: 0 });
+  });
+});
+
+/* ============ SCREEN SHARE ============ */
+let screenStream = null;
+let screenSender = null;
+let screenAudioSender = null;
+let remoteScreenStreamId = null;
+
+const SCREEN_SHARE_SUPPORTED = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
+
+function initScreenShareSupport() {
+  if (SCREEN_SHARE_SUPPORTED) return;
+  const msg = /iPhone|iPad|iPod/.test(navigator.userAgent)
+    ? "Screen sharing isn't supported on iPhone/iPad browsers — that's an Apple restriction, not this app. Try from a laptop instead."
+    : "Screen sharing isn't supported in this browser. Try Chrome on a laptop for this feature.";
+  $("screenShareBtn").disabled = true;
+  $("screenShareBtn").title = msg;
+  $("screenShareBtn").style.opacity = "0.4";
+  $("screenShareBtn").style.cursor = "not-allowed";
+  $("startScreenShareBtn").disabled = true;
+  $("screenshareStatus").textContent = msg;
+}
+
+async function renegotiate() {
+  if (!pc || !remoteSocketId) return;
+  try {
+    makingOffer = true;
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    socket.emit("signal", { to: remoteSocketId, data: pc.localDescription });
+  } catch (err) {
+    console.error("Renegotiation failed:", err);
+  } finally {
+    makingOffer = false;
+  }
+}
+
+async function startScreenShare() {
+  if (!SCREEN_SHARE_SUPPORTED) {
+    alert(
+      /iPhone|iPad|iPod/.test(navigator.userAgent)
+        ? "Screen sharing isn't supported on iPhone/iPad — Apple doesn't allow browsers to do this. Try from a laptop."
+        : "Screen sharing isn't supported in this browser. Try Chrome on a laptop."
+    );
+    return;
+  }
+  // Quality picker (Kosmi-style): Auto lets the browser/OS decide; the fixed
+  // options cap the capture resolution so a slower connection can still keep
+  // up, at the cost of sharpness.
+  const quality = $("screenShareQuality") ? $("screenShareQuality").value : "auto";
+  const QUALITY_PRESETS = {
+    "1080": { width: { ideal: 1920, max: 1920 }, height: { ideal: 1080, max: 1080 }, frameRate: { ideal: 30 } },
+    "720": { width: { ideal: 1280, max: 1280 }, height: { ideal: 720, max: 720 }, frameRate: { ideal: 30 } },
+    "480": { width: { ideal: 854, max: 854 }, height: { ideal: 480, max: 480 }, frameRate: { ideal: 24 } },
+  };
+  const videoConstraints = { cursor: "always", ...(QUALITY_PRESETS[quality] || {}) };
+
+  try {
+    // audio: true captures tab/system sound where the browser & OS allow it —
+    // in Chrome's share picker, pick the "Chrome Tab" option and tick
+    // "Share tab audio" for the most reliable result. Full-desktop sharing
+    // on macOS can't capture system audio at all (an OS-level limit, not
+    // something any app can work around).
+    screenStream = await navigator.mediaDevices.getDisplayMedia({ video: videoConstraints, audio: true });
+  } catch (err) {
+    return; // user cancelled the picker
+  }
+  const videoTrack = screenStream.getVideoTracks()[0];
+  const audioTrack = screenStream.getAudioTracks()[0];
+  videoTrack.contentHint = "detail"; // hint encoders to favor sharpness over motion smoothness
+
+  if (pc) {
+    screenSender = pc.addTrack(videoTrack, screenStream);
+    if (audioTrack) screenAudioSender = pc.addTrack(audioTrack, screenStream);
+    renegotiate();
+    // Apply a bitrate ceiling matched to the chosen resolution so quality
+    // isn't left on the table (Auto/1080p) or wasted on a slow link (480p).
+    const BITRATE_BY_QUALITY = { auto: 4_000_000, "1080": 4_000_000, "720": 2_500_000, "480": 1_200_000 };
+    setTimeout(() => boostVideoBitrate(screenSender, BITRATE_BY_QUALITY[quality] || 2_500_000), 500);
+  }
+
+  screenShareActive = true;
+  refreshMediaVisibility();
+  $("screenShareVideo").srcObject = screenStream;
+  $("screenShareVideo").muted = true;
+  $("screenShareLabel").textContent = audioTrack
+    ? "You're sharing your screen (with sound)"
+    : "You're sharing your screen (no sound captured — see tip below)";
+
+  $("screenShareBtn").classList.add("active");
+  $("startScreenShareBtn").textContent = "Stop sharing";
+
+  videoTrack.onended = stopScreenShare; // user clicked the browser's native "Stop sharing" button
+
+  // On phones (mainly Android Chrome), switching to another app freezes the
+  // shared tab — the other person would otherwise just see a silent, frozen
+  // frame with no explanation. Tell them plainly instead of leaving it a mystery.
+  document.addEventListener("visibilitychange", handleShareVisibilityChange);
+}
+
+function handleShareVisibilityChange() {
+  if (!screenStream || !socket) return;
+  const backgrounded = document.visibilityState === "hidden";
+  socket.emit("media-status", { screenshareBackgrounded: backgrounded });
+}
+
+function stopScreenShare() {
+  document.removeEventListener("visibilitychange", handleShareVisibilityChange);
+  if (screenStream) {
+    screenStream.getTracks().forEach((t) => t.stop());
+    screenStream = null;
+  }
+  if (pc) {
+    if (screenSender) { try { pc.removeTrack(screenSender); } catch (e) {} screenSender = null; }
+    if (screenAudioSender) { try { pc.removeTrack(screenAudioSender); } catch (e) {} screenAudioSender = null; }
+    renegotiate();
+  }
+  socket && socket.emit("media-status", { screenshareBackgrounded: false });
+  screenShareActive = false;
+  $("screenShareVideo").srcObject = null;
+  refreshMediaVisibility();
+  $("screenShareBtn").classList.remove("active");
+  $("startScreenShareBtn").textContent = "Start sharing your screen";
+}
+
+$("screenShareBtn").addEventListener("click", () => {
+  switchToTab("screenshare");
+  if (screenStream) stopScreenShare();
+  else startScreenShare();
+});
+$("startScreenShareBtn").addEventListener("click", () => {
+  if (screenStream) stopScreenShare();
+  else startScreenShare();
+});
+
+$("screenShareFullscreenBtn").addEventListener("click", () => {
+  const frame = document.querySelector(".screen-frame");
+  if (document.fullscreenElement) document.exitFullscreen();
+  else frame.requestFullscreen().catch(() => {});
+});
+
+/* ============ UPLOAD ============ */
+const MAX_UPLOAD_MB = 150;
+
+$("fileInput").addEventListener("change", (e) => {
+  const file = e.target.files[0];
+  if (!file || !roomId) return;
+
+  const sizeMB = file.size / 1024 / 1024;
+  if (sizeMB > MAX_UPLOAD_MB) {
+    $("uploadStatus").textContent = `That clip is ${Math.round(sizeMB)}MB — over the ${MAX_UPLOAD_MB}MB limit. Trim it shorter or compress it first.`;
+    e.target.value = "";
+    return;
+  }
+
+  $("uploadStatus").textContent = "Uploading… 0%";
+
+  const form = new FormData();
+  form.append("video", file);
+
+  // Using XMLHttpRequest instead of fetch specifically because fetch has no
+  // upload-progress event — on a slow mobile connection "Uploading…" with no
+  // number is indistinguishable from actually being stuck.
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", `${SERVER_URL}/api/upload/${roomId}`);
+  xhr.timeout = 10 * 60 * 1000; // matches the server's requestTimeout
+
+  xhr.upload.addEventListener("progress", (evt) => {
+    if (!evt.lengthComputable) return;
+    const pct = Math.round((evt.loaded / evt.total) * 100);
+    $("uploadStatus").textContent = `Uploading… ${pct}%`;
+  });
+
+  xhr.addEventListener("load", () => {
+    let data;
+    try {
+      data = JSON.parse(xhr.responseText);
+    } catch (err) {
+      $("uploadStatus").textContent = "Upload failed — the server sent back something unexpected. Try again in a moment.";
+      return;
+    }
+    if (xhr.status >= 200 && xhr.status < 300 && data.url) {
+      loadUploadedVideo(data.url);
+      emitVideoAction({ type: "upload", source: data.url, isPlaying: false, currentTime: 0 });
+      $("uploadStatus").textContent = `Loaded: ${data.name}`;
+    } else {
+      $("uploadStatus").textContent = data.error || "Upload failed. Try again.";
+    }
+  });
+
+  xhr.addEventListener("error", () => {
+    $("uploadStatus").textContent = "Upload failed — check your connection and that the server is awake (open the site once first if it's been idle a while).";
+  });
+
+  xhr.addEventListener("timeout", () => {
+    $("uploadStatus").textContent = "Upload timed out — your connection may be too slow for this file size. Try a smaller clip or a better connection.";
+  });
+
+  xhr.send(form);
+});
+
+function loadUploadedVideo(url) {
+  loadedMediaType = "upload";
+  loadedSourceId = url;
+  refreshMediaVisibility();
+  const v = $("localVideoPlayer");
+  v.src = url.startsWith("http") ? url : `${SERVER_URL}${url}`;
+}
+
+const videoEl = $("localVideoPlayer");
+videoEl.addEventListener("play", () => {
+  if (suppressSync) return;
+  if (revertPlaybackIfLocked()) return;
+  emitVideoAction({ type: "upload", isPlaying: true, currentTime: videoEl.currentTime });
+});
+videoEl.addEventListener("pause", () => {
+  if (suppressSync) return;
+  if (revertPlaybackIfLocked()) return;
+  emitVideoAction({ type: "upload", isPlaying: false, currentTime: videoEl.currentTime });
+});
+videoEl.addEventListener("seeked", () => {
+  if (suppressSync) return;
+  if (revertPlaybackIfLocked()) return;
+  emitVideoAction({ type: "upload", isPlaying: !videoEl.paused, currentTime: videoEl.currentTime });
+});
+videoEl.addEventListener("timeupdate", updateFilmstripFromLocal);
+
+// QA fix (Video Features #3/#4 — corrupted uploads / failed loads): there
+// used to be no "error" handling on the uploaded-video element at all. A
+// corrupted file, an unsupported codec the browser can't decode, or a URL
+// that 404s (e.g. the room's uploads got cleaned up — see the new server-
+// side cleanup this category also adds) all landed in the same place: a
+// silent black/frozen video tile with no explanation, indistinguishable
+// from "still loading" or "waiting for the other person." Now it surfaces
+// what actually happened, using the same empty-state pattern already used
+// for YouTube embed failures.
+videoEl.addEventListener("error", () => {
+  const err = videoEl.error;
+  const box = $("mediaLoadError");
+  let message;
+  switch (err && err.code) {
+    case 2: // MEDIA_ERR_NETWORK
+      message = "This video stopped loading — check your connection and try again.";
+      break;
+    case 3: // MEDIA_ERR_DECODE
+    case 4: // MEDIA_ERR_SRC_NOT_SUPPORTED
+      message = "This video file couldn't be played — it may be corrupted, or in a format this browser can't decode. Try a different file (MP4/H.264 is the safest bet across browsers).";
+      break;
+    default:
+      message = "This video couldn't be loaded.";
+  }
+  box.textContent = message;
+  box.classList.remove("hidden");
+  videoEl.classList.add("hidden");
+  $("uploadStatus").textContent = message;
+});
+videoEl.addEventListener("loadeddata", () => {
+  $("mediaLoadError").classList.add("hidden");
+  videoEl.classList.remove("hidden");
+});
+
+/* ============ APPLY REMOTE STATE ============ */
+function applyRemoteVideoState(state, isInitialSync) {
+  if (!state || !state.type) return;
+  lastKnownVideoState = state;
+  suppressSync = true;
+  // Release suppressSync only after the player has actually finished
+  // reacting (seeking/loading/buffering), not on a fixed timer — on a
+  // slower connection, buffering can easily take longer than a fixed
+  // delay, which was letting the flag clear early. When it did, the
+  // player's own delayed "now playing" event looked like a brand-new local
+  // action and got echoed straight back to the other device — that's what
+  // caused both the restart-loop and the "pause only worked on one side"
+  // symptoms (a genuine local pause could get silently swallowed if it
+  // landed while a stale echo had the flag stuck on).
+  const release = () => setTimeout(() => (suppressSync = false), 400);
+
+  // QA fix (Synchronization #5 — rejoin after disconnecting): the stored
+  // room state can be stale by the time someone joins/rejoins — they could
+  // be landing minutes after the last play/pause/seek event, and if it was
+  // playing the whole time, real playback has moved on since. This used to
+  // only be corrected for uploaded video (the youtube/spotify branches below
+  // seeked straight to the stale stored position and just waited for the
+  // next periodic drift-correction tick to catch up — which, for the case
+  // fixed in applySyncPing below, could be a while, or never). It also used
+  // to apply even when the video was PAUSED, which is wrong the other way —
+  // a paused video's position doesn't move just because time passed, so
+  // extrapolating forward on rejoin could jump a paused video to the wrong
+  // spot. Now: only extrapolate when it was actually playing, and do it for
+  // all three source types the same way.
+  const extraElapsed = isInitialSync && state.isPlaying
+    ? Math.max(0, (Date.now() - (state.updatedAt || Date.now())) / 1000)
+    : 0;
+  const targetTime = (state.currentTime || 0) + extraElapsed;
+  const syncedState = extraElapsed > 0 ? { ...state, currentTime: targetTime } : state;
+
+  if (state.type === "youtube") {
+    // Same bug as the uploaded-video case above, different mechanism:
+    // `state.source` (the video/playlist id) persists across every
+    // pause/play/seek action once a video is loaded (the server keeps
+    // merging it into room.video), so `if (state.source)` was true on
+    // EVERY action — meaning ensureYoutubePlayer() ran every time, and
+    // since the player already existed, that called YouTube's
+    // loadVideoById()/loadPlaylist(), which **restarts the video from 0
+    // on every single call**, same video or not. That's the "starts over
+    // and over" / mismatched-time behavior: pausing or seeking on one
+    // side made the other side's player reload and restart, then race
+    // against a seek to the correct time that often lost.
+    // Fix: only (re)load when the video/playlist actually changed —
+    // otherwise just seek/play the player that's already there.
+    const needsLoad = state.source && (!ytPlayer || loadedMediaType !== "youtube" || !sameYoutubeSource(loadedSourceId, state.source));
+    if (needsLoad) {
+      ensureYoutubePlayer(state.source, () => { seekAndPlayYoutube(syncedState); release(); });
+    } else if (ytPlayer) {
+      seekAndPlayYoutube(syncedState);
+      release();
+    } else {
+      suppressSync = false;
+    }
+  } else if (state.type === "upload") {
+    // Bug found: this used to compare `videoEl.src` (which the DOM ALWAYS
+    // resolves to a full absolute URL, e.g. "https://app.com/uploads/x.mp4")
+    // against `fullUrl` built from a RELATIVE `state.source`
+    // ("/uploads/x.mp4") whenever SERVER_URL is empty (the normal
+    // same-origin deployment). Those two strings can never be equal, so this
+    // reloaded the entire video from scratch on every single pause/play/seek
+    // the other person made — which blanked the screen while it re-buffered,
+    // and restarted from 0 because `currentTime` was set before the
+    // freshly-reloaded video had even loaded metadata to seek within.
+    // Fix: track what we've already loaded (`loadedSourceId`, set by
+    // loadUploadedVideo itself) and only reload when the source actually
+    // changed — not every time play state does.
+    if (state.source && (loadedMediaType !== "upload" || loadedSourceId !== state.source)) {
+      loadUploadedVideo(state.source);
+    }
+    const drift = Math.abs(videoEl.currentTime - targetTime);
+    if (drift > 1) videoEl.currentTime = targetTime;
+    // A play() triggered here is reacting to the *other* person's tap, not
+    // a gesture on this page — mobile Chrome/Safari block unmuted
+    // programmatic playback in that case and just silently fail, which is
+    // what showed up as "black screen, no sound" on phones (desktop is more
+    // lenient, so the same code looked fine there). Same fallback already
+    // used for the incoming call/screen-share video: try normally, and if
+    // that's blocked, play muted (always allowed) and offer a one-tap
+    // unmute button.
+    if (state.isPlaying) playWithUnmuteFallback(videoEl, $("mediaUnmuteBtn"));
+    else videoEl.pause();
+    release();
+  } else if (state.type === "spotify") {
+    if (state.source && spotifyController === null) {
+      const [type, id] = state.source.split(":");
+      ensureSpotifyPlayer({ type, id }, () => { applySpotifyPlaybackState(syncedState); release(); });
+    } else if (spotifyController) {
+      applySpotifyPlaybackState(syncedState);
+      release();
+    } else {
+      suppressSync = false;
+    }
+  } else {
+    suppressSync = false;
+  }
+}
+
+function seekAndPlayYoutube(state) {
+  if (!ytPlayer || !ytPlayer.getCurrentTime) return;
+  const drift = Math.abs(ytPlayer.getCurrentTime() - (state.currentTime || 0));
+  if (drift > 1.2) ytPlayer.seekTo(state.currentTime || 0, true);
+  if (state.isPlaying) {
+    ytPlayer.playVideo();
+    // Same mobile autoplay block as the uploaded-video case, but the
+    // YouTube iframe API has no play()-promise to catch — it just quietly
+    // stays paused instead. Give it a beat, then check whether it actually
+    // started; if not, fall back to muted playback (always allowed) with a
+    // tap-to-unmute button.
+    setTimeout(() => {
+      if (ytPlayer && ytPlayer.getPlayerState && ytPlayer.getPlayerState() !== 1 /* YT.PlayerState.PLAYING */) {
+        ytPlayer.mute();
+        ytPlayer.playVideo();
+        $("ytUnmuteBtn").classList.remove("hidden");
+      }
+    }, 700);
+  } else {
+    ytPlayer.pauseVideo();
+    $("ytUnmuteBtn").classList.add("hidden");
+  }
+}
+
+/* ============ FILMSTRIP SCRUBBER ============ */
+function getCurrentPlaybackTime() {
+  if (sourceType === "youtube" && ytPlayer && ytPlayer.getCurrentTime) return ytPlayer.getCurrentTime();
+  if (sourceType === "upload") return videoEl.currentTime;
+  if (sourceType === "spotify") return spotifyLastPosition;
+  return 0;
+}
+// Same idea, but follows whatever's actually loaded rather than whichever
+// tab you're currently looking at — used for background sync so drift
+// correction keeps working while you're browsing Games/Screenshare/etc.
+function getLoadedPlaybackTime() {
+  if (loadedMediaType === "youtube" && ytPlayer && ytPlayer.getCurrentTime) return ytPlayer.getCurrentTime();
+  if (loadedMediaType === "upload") return videoEl.currentTime;
+  if (loadedMediaType === "spotify") return spotifyLastPosition;
+  return 0;
+}
+function getDuration() {
+  if (sourceType === "youtube" && ytPlayer && ytPlayer.getDuration) return ytPlayer.getDuration() || 0;
+  if (sourceType === "upload") return videoEl.duration || 0;
+  if (sourceType === "spotify") return spotifyLastDuration || 0;
+  return 0;
+}
+
+function updateFilmstripFromLocal() {
+  const dur = getDuration();
+  const cur = getCurrentPlaybackTime();
+  if (!dur) return;
+  const pct = (cur / dur) * 100;
+  $("progressFill").style.width = `${pct}%`;
+  $("scrubberInput").value = Math.floor((cur / dur) * 1000);
+}
+
+setInterval(updateFilmstripFromLocal, 500);
+
+$("scrubberInput").addEventListener("input", (e) => {
+  const dur = getDuration();
+  if (!dur) return;
+  const target = (e.target.value / 1000) * dur;
+  if (sourceType === "youtube" && ytPlayer) ytPlayer.seekTo(target, true);
+  else if (sourceType === "upload") videoEl.currentTime = target;
+  else if (sourceType === "spotify" && spotifyController && spotifyController.seek) spotifyController.seek(target);
+});
+$("scrubberInput").addEventListener("change", () => {
+  if (revertPlaybackIfLocked()) return;
+  const cur = getCurrentPlaybackTime();
+  const isPlaying = sourceType === "upload" ? !videoEl.paused : true;
+  emitVideoAction({ type: sourceType, isPlaying, currentTime: cur });
+});
+
+/* ============ DOUBLE-TAP REACTION ON SCREEN ============ */
+document.querySelector(".screen-frame").addEventListener("dblclick", () => {
+  socket.emit("reaction", { emoji: "❤️" });
+  spawnFloatingEmoji("❤️");
+});
+
+initScreenShareSupport();
+applyDirectorState(null);
+renderWatchlist([]);
+
+/* ============ PERIODIC DRIFT CORRECTION ============ */
+// play/pause/seek events keep things roughly in sync, but small gaps build up
+// over a few minutes (buffering, slightly different clocks, etc). Every few
+// seconds each side quietly reports where it actually is, and the other side
+// nudges its own position back in line if it's drifted more than ~1.5s.
+setInterval(() => {
+  if (!socket || !roomId) return;
+  if (loadedMediaType !== "youtube" && loadedMediaType !== "spotify" && loadedMediaType !== "upload") return;
+  const currentTime = getLoadedPlaybackTime();
+  if (!currentTime) return;
+  socket.emit("sync-ping", { type: loadedMediaType, currentTime });
+}, 4000);
+
+function applySyncPing(state) {
+  if (suppressSync || state.type !== loadedMediaType) return;
+
+  // Both sides used to correct toward whatever the other last reported,
+  // with no tie-breaker — on any real network latency, that turns into both
+  // sides repeatedly overruling each other every 4s, which reads as the
+  // playback constantly jumping/mismatching rather than settling down.
+  // Only the socket with the lower id acts as the "authority" here: it
+  // never seeks based on incoming pings, it only sends its own position;
+  // the other side is the only one that ever corrects. One-directional,
+  // so there's nothing left to oscillate.
+  //
+  // QA fix (Synchronization #4/#6 — drift correction / cross-platform):
+  // this used to compare against remoteSocketId, which is ONLY ever set by
+  // the WebRTC call-signaling code (peer-joined/peer-left) — and that code
+  // is skipped entirely in native mode (?native=1), since the Android app
+  // handles the call itself. That meant the two "media"-role sockets used
+  // by the native Android app (one per phone, for chat/movies/sync while
+  // the native app handles the call) never had a remoteSocketId, so this
+  // function always bailed out here and drift correction silently never
+  // ran at all for the native app — despite the README claiming YouTube/
+  // Spotify/uploads all quietly re-sync in the background. Comparing
+  // against the sender id on the ping itself (which the server now
+  // attaches) makes this work for any two participants regardless of role,
+  // not just the two call-connected browser tabs.
+  if (!socket || !socket.id || !state.from) return;
+  const iAmAuthority = socket.id < state.from;
+  if (iAmAuthority) return;
+
+  const localTime = getLoadedPlaybackTime();
+  const drift = Math.abs(localTime - (state.currentTime || 0));
+  if (drift < 1.5) return;
+
+  suppressSync = true;
+  if (loadedMediaType === "youtube" && ytPlayer && ytPlayer.seekTo) {
+    ytPlayer.seekTo(state.currentTime, true);
+  } else if (loadedMediaType === "upload") {
+    videoEl.currentTime = state.currentTime;
+  } else if (loadedMediaType === "spotify" && spotifyController && spotifyController.seek) {
+    spotifyController.seek(state.currentTime);
+  }
+  // A seek can trigger a brief buffering spell before settling back to
+  // playing — give it more headroom than a play/pause reaction needs, so a
+  // slow connection doesn't let this clear early and misread its own
+  // delayed "playing again" event as a new local action (same root cause
+  // as the fix in applyRemoteVideoState above, just for the smaller
+  // periodic correction instead of a full play/pause).
+  setTimeout(() => (suppressSync = false), 1200);
+}
+
+/* ============ GAMES ============ */
+// Same trust model as the rest of the app (no server-side validation of
+// video state, chat, etc.) — the server just relays the latest state and
+// both clients compute turns/winners identically. Good enough for two
+// people who trust each other; not meant to survive a determined cheater.
+
+let currentGame = null; // 'ttt' | 'connect4' | 'draw' | null
+let tttState = null;
+let c4State = null;
+let drawState = null;
+let drawCtx = null;
+let isDrawingNow = false;
+let lastDrawPoint = null;
+let currentDrawColor = "#1a1300";
+let currentDrawSize = 4;
+
+const DRAW_WORDS = [
+  "pizza", "guitar", "sunset", "castle", "dragon", "bicycle", "rainbow", "penguin",
+  "volcano", "sandwich", "umbrella", "spaceship", "waterfall", "butterfly", "campfire",
+  "lighthouse", "snowman", "treasure", "octopus", "skateboard", "balloon", "jellyfish",
+  "cactus", "mermaid", "robot", "pancake", "tornado", "unicorn", "backpack", "fireworks",
+];
+
+document.querySelectorAll(".game-pick-btn").forEach((btn) => {
+  btn.addEventListener("click", () => startGame(btn.dataset.game));
+});
+$("gameNewBtn").addEventListener("click", () => { if (currentGame) startGame(currentGame); });
+
+function startGame(gameId) {
+  currentGame = gameId;
+  document.querySelectorAll(".game-pick-btn").forEach((b) => b.classList.toggle("active", b.dataset.game === gameId));
+  $("gameNewBtn").classList.remove("hidden");
+
+  let initialState;
+  if (gameId === "ttt") {
+    initialState = { board: Array(9).fill(null), turn: "X", winner: null, winLine: null };
+  } else if (gameId === "connect4") {
+    initialState = { board: Array(42).fill(null), turn: "red", winner: null, winLine: null };
+  } else if (gameId === "draw") {
+    const word = DRAW_WORDS[Math.floor(Math.random() * DRAW_WORDS.length)];
+    initialState = { drawerIsHost: true, word, round: 1, score: { host: 0, guest: 0 }, revealed: false };
+  }
+  socket.emit("game-select", { id: gameId, state: initialState });
+  applyRemoteGameState({ id: gameId, state: initialState }, true);
+}
+
+// `mine` = true when this update originated on our own client (either we
+// just picked the game, or we're replaying room-state on join) — used only
+// to avoid re-emitting an echo of what we just sent. This function only
+// ever updates the underlying game data/render — it never decides whether
+// the Games tab is actually visible right now; refreshMediaVisibility()
+// (driven by whichever tab you're actually looking at) owns that.
+function applyRemoteGameState(game, mine) {
+  if (!game || !game.id) return;
+  currentGame = game.id;
+  document.querySelectorAll(".game-pick-btn").forEach((b) => b.classList.toggle("active", b.dataset.game === game.id));
+  $("gameNewBtn").classList.remove("hidden");
+  refreshMediaVisibility();
+
+  if (game.id === "ttt") {
+    tttState = game.state;
+    renderTTT();
+  } else if (game.id === "connect4") {
+    c4State = game.state;
+    renderConnect4();
+  } else if (game.id === "draw") {
+    drawState = game.state;
+    renderDrawGame(!mine); // only clear canvas on a fresh round pushed by the other player
+  }
+}
+
+/* ---- Tic-Tac-Toe ---- */
+const TTT_LINES = [
+  [0,1,2],[3,4,5],[6,7,8],
+  [0,3,6],[1,4,7],[2,5,8],
+  [0,4,8],[2,4,6],
+];
+function tttCheckWinner(board) {
+  for (const line of TTT_LINES) {
+    const [a,b,c] = line;
+    if (board[a] && board[a] === board[b] && board[a] === board[c]) return { winner: board[a], line };
+  }
+  if (board.every((c) => c)) return { winner: "draw", line: null };
+  return null;
+}
+
+function renderTTT() {
+  const mySymbol = amHost ? "X" : "O";
+  const isMyTurn = tttState.turn === mySymbol && !tttState.winner;
+  const status = tttState.winner
+    ? tttState.winner === "draw" ? "It's a draw!" : `<b>${tttState.winner}</b> wins! 🎉`
+    : isMyTurn ? `Your turn (<b>${mySymbol}</b>)` : `Waiting on them (<b>${tttState.turn}</b>)`;
+
+  const cells = tttState.board.map((val, i) => {
+    const isWin = tttState.winLine && tttState.winLine.includes(i);
+    return `<div class="ttt-cell ${val ? "filled" : ""} ${val === "O" ? "o-mark" : ""} ${isWin ? "win-cell" : ""}" data-i="${i}">${val || ""}</div>`;
+  }).join("");
+
+  $("gameArea").innerHTML = `
+    <div class="game-status-line">${status}</div>
+    <div class="ttt-board">${cells}</div>
+  `;
+
+  $("gameArea").querySelectorAll(".ttt-cell").forEach((cell) => {
+    cell.addEventListener("click", () => {
+      const i = Number(cell.dataset.i);
+      if (tttState.winner || tttState.board[i] || tttState.turn !== mySymbol) return;
+      const board = tttState.board.slice();
+      board[i] = mySymbol;
+      const result = tttCheckWinner(board);
+      tttState = {
+        board,
+        turn: mySymbol === "X" ? "O" : "X",
+        winner: result ? result.winner : null,
+        winLine: result ? result.line : null,
+      };
+      socket.emit("game-action", tttState);
+      renderTTT();
+    });
+  });
+}
+
+/* ---- Connect Four ---- */
+// board is a flat array of 42 cells, row-major, row 0 = top.
+function c4DropRow(board, col) {
+  for (let row = 5; row >= 0; row--) {
+    if (!board[row * 7 + col]) return row;
+  }
+  return -1;
+}
+function c4CheckWinner(board) {
+  const get = (r, c) => (r < 0 || r > 5 || c < 0 || c > 6 ? null : board[r * 7 + c]);
+  const dirs = [[0,1],[1,0],[1,1],[1,-1]];
+  for (let r = 0; r < 6; r++) {
+    for (let c = 0; c < 7; c++) {
+      const color = get(r, c);
+      if (!color) continue;
+      for (const [dr, dc] of dirs) {
+        const cells = [0,1,2,3].map((k) => [r + dr*k, c + dc*k]);
+        if (cells.every(([rr, cc]) => get(rr, cc) === color)) {
+          return { winner: color, line: cells.map(([rr, cc]) => rr * 7 + cc) };
+        }
+      }
+    }
+  }
+  if (board.every((c) => c)) return { winner: "draw", line: null };
+  return null;
+}
+
+function renderConnect4() {
+  const myColor = amHost ? "red" : "yellow";
+  const isMyTurn = c4State.turn === myColor && !c4State.winner;
+  const status = c4State.winner
+    ? c4State.winner === "draw" ? "It's a draw!" : `<b style="color:${c4State.winner === "red" ? "var(--danger)" : "var(--accent)"}">${c4State.winner}</b> wins! 🎉`
+    : isMyTurn ? `Your turn (<b>${myColor}</b>)` : `Waiting on them (<b>${c4State.turn}</b>)`;
+
+  const cells = c4State.board.map((val, i) => {
+    const isWin = c4State.winLine && c4State.winLine.includes(i);
+    return `<div class="c4-cell ${val || "empty"} ${isWin ? "win-cell" : ""}" data-col="${i % 7}"></div>`;
+  }).join("");
+
+  $("gameArea").innerHTML = `
+    <div class="game-status-line">${status}</div>
+    <div class="c4-board">${cells}</div>
+  `;
+
+  $("gameArea").querySelectorAll(".c4-cell").forEach((cell) => {
+    cell.addEventListener("click", () => {
+      const col = Number(cell.dataset.col);
+      if (c4State.winner || c4State.turn !== myColor) return;
+      const row = c4DropRow(c4State.board, col);
+      if (row === -1) return; // column full
+      const board = c4State.board.slice();
+      board[row * 7 + col] = myColor;
+      const result = c4CheckWinner(board);
+      c4State = {
+        board,
+        turn: myColor === "red" ? "yellow" : "red",
+        winner: result ? result.winner : null,
+        winLine: result ? result.line : null,
+      };
+      socket.emit("game-action", c4State);
+      renderConnect4();
+    });
+  });
+}
+
+/* ---- Draw & Guess ---- */
+function renderDrawGame(clearCanvas) {
+  const amDrawer = (amHost && drawState.drawerIsHost) || (!amHost && !drawState.drawerIsHost);
+  const wordDisplay = amDrawer
+    ? `Your word: <b>${drawState.word}</b>`
+    : `<span class="word-blanks">${drawState.word.split("").map(() => "_").join(" ")}</span> (${drawState.word.length} letters)`;
+  const myScore = amHost ? drawState.score.host : drawState.score.guest;
+  const theirScore = amHost ? drawState.score.guest : drawState.score.host;
+
+  $("gameArea").innerHTML = `
+    <div class="draw-wrap">
+      <div class="game-status-line">
+        Round ${drawState.round} · You ${myScore} – ${theirScore} them ·
+        ${amDrawer ? "You're drawing, they're guessing! 🎨" : "Guess the word in chat 👀"}
+      </div>
+      <div class="game-status-line">${wordDisplay}</div>
+      <div class="draw-toolbar">
+        ${["#1a1300","#E2607A","#8C9EFF","#3fae56","#F2A65A","#ffffff"].map((c) =>
+          `<button class="draw-color" data-color="${c}" style="background:${c}"></button>`).join("")}
+        <button id="drawClearBtn" class="btn btn-ghost btn-small">🧹 Clear</button>
+        ${amDrawer ? '<button id="drawSkipBtn" class="btn btn-ghost btn-small">⏭️ Skip word</button>' : ""}
+      </div>
+      <canvas id="drawCanvas" width="600" height="360"></canvas>
+    </div>
+  `;
+
+  const canvas = $("drawCanvas");
+  drawCtx = canvas.getContext("2d");
+  if (clearCanvas !== false) drawCtx.clearRect(0, 0, canvas.width, canvas.height);
+
+  $("gameArea").querySelectorAll(".draw-color").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      currentDrawColor = btn.dataset.color;
+      $("gameArea").querySelectorAll(".draw-color").forEach((b) => b.classList.toggle("active", b === btn));
+    });
+  });
+  $("drawClearBtn").addEventListener("click", () => clearCanvasLocal(true));
+  if (amDrawer) {
+    $("drawSkipBtn").addEventListener("click", () => advanceDrawRound(false));
+    canvas.addEventListener("pointerdown", (e) => { isDrawingNow = true; lastDrawPoint = canvasPoint(canvas, e); });
+    canvas.addEventListener("pointermove", (e) => {
+      if (!isDrawingNow) return;
+      const pt = canvasPoint(canvas, e);
+      const stroke = { x0: lastDrawPoint.x, y0: lastDrawPoint.y, x1: pt.x, y1: pt.y, color: currentDrawColor, size: currentDrawSize };
+      drawStrokeOnCanvas(stroke, true);
+      socket.emit("draw-stroke", stroke);
+      lastDrawPoint = pt;
+    });
+    ["pointerup", "pointerleave"].forEach((ev) => canvas.addEventListener(ev, () => (isDrawingNow = false)));
+  } else {
+    canvas.style.cursor = "default";
+  }
+}
+
+function canvasPoint(canvas, e) {
+  const rect = canvas.getBoundingClientRect();
+  return {
+    x: ((e.clientX - rect.left) / rect.width) * canvas.width,
+    y: ((e.clientY - rect.top) / rect.height) * canvas.height,
+  };
+}
+
+function drawStrokeOnCanvas(stroke) {
+  if (!drawCtx) return;
+  drawCtx.strokeStyle = stroke.color;
+  drawCtx.lineWidth = stroke.size;
+  drawCtx.lineCap = "round";
+  drawCtx.beginPath();
+  drawCtx.moveTo(stroke.x0, stroke.y0);
+  drawCtx.lineTo(stroke.x1, stroke.y1);
+  drawCtx.stroke();
+}
+
+function clearCanvasLocal(broadcast) {
+  const canvas = $("drawCanvas");
+  if (canvas && drawCtx) drawCtx.clearRect(0, 0, canvas.width, canvas.height);
+  if (broadcast) socket.emit("draw-clear");
+}
+
+// Called when a chat message is submitted while the Draw & Guess game is
+// active — checks it against the current word and, if right, scores a
+// point, swaps who's drawing, and starts a new round.
+function maybeCheckDrawGuess(text) {
+  if (currentGame !== "draw" || !drawState) return;
+  const amDrawer = (amHost && drawState.drawerIsHost) || (!amHost && !drawState.drawerIsHost);
+  if (amDrawer) return; // the drawer guessing their own word doesn't count
+  if (text.trim().toLowerCase() === drawState.word.toLowerCase()) {
+    advanceDrawRound(true);
+  }
+}
+
+function advanceDrawRound(guesserWon) {
+  const score = { ...drawState.score };
+  if (guesserWon) {
+    if (amHost && !drawState.drawerIsHost) score.host += 1; // host was guessing and won
+    if (!amHost && drawState.drawerIsHost) score.guest += 1; // guest was guessing and won
+  }
+  const word = DRAW_WORDS[Math.floor(Math.random() * DRAW_WORDS.length)];
+  drawState = {
+    drawerIsHost: !drawState.drawerIsHost, // swap who draws next
+    word,
+    round: drawState.round + 1,
+    score,
+    revealed: false,
+  };
+  socket.emit("game-action", drawState);
+  renderDrawGame(true);
+  if (guesserWon) {
+    socket.emit("reaction", { emoji: "🎉" });
+    spawnFloatingEmoji("🎉");
+  }
+}
+
+/* ============ ACCOUNTS (optional) ============
+   Everything below is additive and self-contained: nothing above this
+   point depends on it, and if the API calls fail for any reason the app
+   just behaves as if nobody's logged in — the guest create/join flow
+   (above) never depended on any of this. */
+
+const API_BASE = SERVER_URL || "";
+let currentAccount = null; // { username } | null
+let accountMode = "login"; // "login" | "signup"
+
+function readCookie(name) {
+  const match = document.cookie.match(new RegExp("(?:^|; )" + name + "=([^;]*)"));
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+// Wraps fetch with credentials (so the session cookie is sent/received) and
+// the CSRF header double-submit-cookie pattern requires for POSTs.
+async function accountFetch(pathName, options = {}) {
+  const headers = Object.assign({}, options.headers);
+  if (options.method && options.method !== "GET") {
+    headers["Content-Type"] = "application/json";
+    const csrf = readCookie("together_csrf");
+    if (csrf) headers["X-CSRF-Token"] = csrf;
+  }
+  const res = await fetch(`${API_BASE}${pathName}`, {
+    ...options,
+    headers,
+    credentials: "include",
+  });
+  let data = null;
+  try {
+    data = await res.json();
+  } catch (e) {
+    // no body
+  }
+  if (!res.ok) {
+    throw new Error((data && data.error) || "Something went wrong.");
+  }
+  return data;
+}
+
+function saveRoomOwnership(roomIdToSave, label) {
+  accountFetch("/api/auth/my-rooms", {
+    method: "POST",
+    body: JSON.stringify({ roomId: roomIdToSave, label }),
+  }).catch(() => {}); // best-effort — the room still works fine even if this fails
+}
+
+function setAccountError(msg) {
+  const existing = $("accountForm").querySelector(".account-error");
+  if (existing) existing.remove();
+  if (!msg) return;
+  const p = document.createElement("p");
+  p.className = "account-error";
+  p.textContent = msg;
+  $("accountForm").appendChild(p);
+}
+
+function renderAccountUI() {
+  const loggedOut = $("accountLoggedOut");
+  const loggedIn = $("accountLoggedIn");
+  if (currentAccount) {
+    loggedOut.classList.add("hidden");
+    loggedIn.classList.remove("hidden");
+    $("accountCornerBtn").textContent = `👤 ${currentAccount.username}`;
+    $("accountUsernameLabel").textContent = currentAccount.username;
+    loadMyRooms();
+  } else {
+    loggedOut.classList.remove("hidden");
+    loggedIn.classList.add("hidden");
+    $("accountCornerBtn").textContent = "Log in";
+  }
+}
+
+function loadMyRooms() {
+  accountFetch("/api/auth/my-rooms")
+    .then(({ rooms }) => {
+      const el = $("accountMyRooms");
+      el.innerHTML = "";
+      if (!rooms || rooms.length === 0) {
+        el.innerHTML = '<p class="account-empty-rooms">No rooms yet — create one and it\'ll show up here.</p>';
+        return;
+      }
+      rooms.forEach((r) => {
+        const row = document.createElement("div");
+        row.className = "account-room-row";
+        row.innerHTML = `<span class="mono">${escapeHtml(r.room_id)}</span>`;
+        const joinBtn = document.createElement("button");
+        joinBtn.textContent = "Join";
+        joinBtn.addEventListener("click", () => {
+          const name = currentAccount.username;
+          $("accountPanel").classList.add("hidden");
+          enterRoom(r.room_id, name);
+        });
+        row.appendChild(joinBtn);
+        el.appendChild(row);
+      });
+    })
+    .catch(() => {});
+}
+
+$("accountCornerBtn").addEventListener("click", () => {
+  $("accountPanel").classList.toggle("hidden");
+});
+$("accountPanelClose").addEventListener("click", () => {
+  $("accountPanel").classList.add("hidden");
+});
+
+function setAccountMode(mode) {
+  accountMode = mode;
+  $("accountTabLogin").classList.toggle("active", mode === "login");
+  $("accountTabSignup").classList.toggle("active", mode === "signup");
+  $("accountSubmitBtn").textContent = mode === "login" ? "Log in" : "Sign up";
+  $("accountPassword").autocomplete = mode === "login" ? "current-password" : "new-password";
+  setAccountError(null);
+}
+$("accountTabLogin").addEventListener("click", () => setAccountMode("login"));
+$("accountTabSignup").addEventListener("click", () => setAccountMode("signup"));
+
+$("accountForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const username = $("accountUsername").value.trim();
+  const password = $("accountPassword").value;
+  setAccountError(null);
+  $("accountSubmitBtn").disabled = true;
+  try {
+    const { username: loggedInAs } = await accountFetch(`/api/auth/${accountMode}`, {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    });
+    currentAccount = { username: loggedInAs };
+    $("accountUsername").value = "";
+    $("accountPassword").value = "";
+    renderAccountUI();
+  } catch (err) {
+    setAccountError(err.message);
+  } finally {
+    $("accountSubmitBtn").disabled = false;
+  }
+});
+
+$("accountLogoutBtn").addEventListener("click", async () => {
+  try {
+    await accountFetch("/api/auth/logout", { method: "POST" });
+  } catch (e) {
+    // clear the local view either way
+  }
+  currentAccount = null;
+  renderAccountUI();
+});
+
+// Check for an existing session on page load (e.g. returning within the
+// 7-day cookie lifetime) — silently a no-op if there isn't one.
+if (!NATIVE_MODE) {
+  accountFetch("/api/auth/me")
+    .then(({ user }) => {
+      if (user) {
+        currentAccount = user;
+        renderAccountUI();
+      }
+    })
+    .catch(() => {});
+}
